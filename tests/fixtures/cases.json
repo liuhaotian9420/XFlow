@@ -1,0 +1,23 @@
+[
+  {
+    "name": "sales_trend_east",
+    "file": "sales_data.csv",
+    "question": "华东区最近3个月销售趋势",
+    "expected_chart_type": "line",
+    "expected_metric_column": "amount"
+  },
+  {
+    "name": "dept_satisfaction_compare",
+    "file": "employee_survey.csv",
+    "question": "各部门满意度对比",
+    "expected_chart_type": "bar",
+    "expected_metric_column": "score"
+  },
+  {
+    "name": "channel_distribution",
+    "file": "web_traffic.csv",
+    "question": "各渠道流量分布",
+    "expected_chart_type": "histogram",
+    "expected_metric_column": "visits"
+  }
+]
