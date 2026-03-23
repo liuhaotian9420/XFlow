@@ -1,5 +1,7 @@
 # xyf-competition-mvp
 
+> [简体中文](README.zh-CN.md)
+
 A natural-language-driven data analytics workbench.
 
 Upload a CSV/Excel file, describe what you want to analyze in plain language, review the generated analysis plan, and get back a chart, table, and summary — all without writing SQL or code.
@@ -114,7 +116,8 @@ xyf-competition-mvp/
 │   └── start-dev.ps1           # One-click dev startup (PowerShell)
 ├── docs/
 │   ├── product-thoughts.md     # Product design notes
-│   └── architecture.md         # Developer guide (read this next)
+│   ├── architecture.md         # Developer guide (English)
+│   └── architecture.zh-CN.md   # Developer guide (简体中文)
 └── pyproject.toml
 ```
 

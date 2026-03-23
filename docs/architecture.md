@@ -1,5 +1,7 @@
 # Architecture & Developer Guide
 
+> [简体中文](architecture.zh-CN.md)
+
 This document explains how the system is structured, how the layers connect, and how to extend it. Start here if you are contributing to this repo for the first time.
 
 ---
