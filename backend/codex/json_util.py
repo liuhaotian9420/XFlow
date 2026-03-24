@@ -1,14 +1,14 @@
-"""Extract JSON payloads from noisy agent stdout (fences, extra text)."""
+"""Extract JSON payloads from noisy Codex stdout (fences, extra text)."""
 
 from __future__ import annotations
 
 import json
 
-from backend.acp.errors import CodexAdapterError
+from backend.codex.errors import CodexAdapterError
 
 
 def extract_json_array_payload(raw: str) -> list:
-    """Parse a JSON array from agent stdout."""
+    """Parse a JSON array from model stdout."""
     raw = raw.strip()
     try:
         payload = json.loads(raw)
@@ -20,13 +20,13 @@ def extract_json_array_payload(raw: str) -> list:
     start = raw.find("[")
     end = raw.rfind("]")
     if start == -1 or end == -1 or end <= start:
-        raise CodexAdapterError("Cannot locate JSON array in agent output.")
+        raise CodexAdapterError("Cannot locate JSON array in model output.")
     candidate = raw[start : end + 1]
     try:
         payload = json.loads(candidate)
     except json.JSONDecodeError as exc:
         raise CodexAdapterError(
-            f"Invalid JSON array extracted from agent output: {exc}"
+            f"Invalid JSON array extracted from model output: {exc}"
         ) from exc
     if not isinstance(payload, list):
         raise CodexAdapterError("Extracted JSON is not an array.")
@@ -34,7 +34,7 @@ def extract_json_array_payload(raw: str) -> list:
 
 
 def extract_json_payload(raw: str) -> dict:
-    """Parse a JSON object from agent stdout."""
+    """Parse a JSON object from model stdout."""
     raw = raw.strip()
     try:
         return json.loads(raw)
@@ -44,11 +44,12 @@ def extract_json_payload(raw: str) -> dict:
     start = raw.find("{")
     end = raw.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise CodexAdapterError("Cannot locate JSON object in agent output.")
+        raise CodexAdapterError("Cannot locate JSON object in model output.")
     candidate = raw[start : end + 1]
     try:
         return json.loads(candidate)
     except json.JSONDecodeError as exc:
         raise CodexAdapterError(
-            f"Invalid JSON extracted from agent output: {exc}"
+            f"Invalid JSON extracted from model output: {exc}"
         ) from exc
+

@@ -1,0 +1,720 @@
+"""One-shot ``codex exec`` subprocess provider."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import tempfile
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from backend.codex.errors import CodexAdapterError
+from backend.codex.json_util import extract_json_array_payload, extract_json_payload
+from backend.codex.prompts import (
+    build_chat_prompt,
+    build_followups_prompt,
+    build_plan_prompt,
+    build_revise_plan_prompt,
+    build_summary_prompt,
+)
+from backend.codex.xinfei_sso import resolve_codex_executable
+from backend.observability import log_event, save_snapshot
+from backend.schemas.plan import AnalysisPlan
+from backend.skills import (
+    SKILL_ANALYSIS_PLANNER,
+    SKILL_DATA_CHAT,
+    SKILL_PLAN_REVISER,
+    skill_instructions_for_prompt,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _format_exception_for_logs(exc: BaseException, *, max_chain: int = 5) -> str:
+    parts: list[str] = []
+    cur: BaseException | None = exc
+    for _ in range(max_chain):
+        if cur is None:
+            break
+        name = type(cur).__name__
+        text = str(cur).strip()
+        if not text:
+            if isinstance(cur, ValidationError):
+                try:
+                    text = cur.json()
+                except Exception:
+                    text = repr(cur)
+            else:
+                text = repr(cur)
+        parts.append(f"{name}: {text}")
+        cur = cur.__cause__ or cur.__context__
+    return " | ".join(parts) if parts else repr(exc)
+
+
+def _codex_exec_config_args(
+    model_override: str | None = None,
+    reasoning_override: str | None = None,
+) -> list[str]:
+    parts: list[str] = []
+    model = (model_override or "").strip() or os.getenv("CODEX_MODEL", "").strip()
+    if model:
+        parts.extend(["-c", f"model={json.dumps(model, ensure_ascii=False)}"])
+
+    reasoning = (reasoning_override or "").strip().lower()
+    if not reasoning:
+        reasoning = os.getenv("CODEX_REASONING_EFFORT", "").strip().lower()
+    if not reasoning:
+        reasoning = os.getenv("CODEX_THINK_LEVEL", "").strip().lower()
+    if reasoning:
+        parts.extend(
+            [
+                "-c",
+                f"model_reasoning_effort={json.dumps(reasoning, ensure_ascii=False)}",
+            ]
+        )
+
+    disable_mcp = os.getenv("CODEX_DISABLE_MCP", "true").strip().lower()
+    if disable_mcp not in ("0", "false", "no", "off"):
+        raw_servers = os.getenv(
+            "CODEX_MCP_DISABLE_SERVERS", "notion,linear,figma,playwright"
+        ).strip()
+        servers = [s.strip() for s in raw_servers.split(",") if s.strip()]
+        for server in servers:
+            parts.extend(["-c", f"mcp_servers.{server}.enabled=false"])
+
+    raw = os.getenv("CODEX_HTTP_TRANSPORT_ONLY", "true").strip().lower()
+    if raw not in ("0", "false", "no", "off"):
+        alias = os.getenv("CODEX_SSE_PROVIDER_ID", "openai_sse").strip() or "openai_sse"
+        display_name = (
+            os.getenv("CODEX_MODEL_PROVIDER_NAME", "OpenAI (HTTP/SSE)").strip()
+            or "OpenAI (HTTP/SSE)"
+        )
+        name_toml = json.dumps(display_name, ensure_ascii=False)
+        parts.extend(
+            [
+                "-c",
+                f"model_providers.{alias}.name={name_toml}",
+                "-c",
+                f"model_providers.{alias}.requires_openai_auth=true",
+                "-c",
+                f"model_providers.{alias}.wire_api=responses",
+                "-c",
+                f"model_providers.{alias}.supports_websockets=false",
+                "-c",
+                f"model_provider={alias}",
+            ]
+        )
+
+    extra = os.getenv("CODEX_EXTRA_CONFIG", "").strip()
+    if extra:
+        for segment in extra.split(";"):
+            segment = segment.strip()
+            if segment:
+                parts.extend(["-c", segment])
+    return parts
+
+
+def _stdio_to_codex_result(stdout: bytes, stderr: bytes, returncode: int) -> str:
+    out_text = stdout.decode("utf-8", errors="ignore").strip()
+    err_text = stderr.decode("utf-8", errors="ignore").strip()
+    if returncode != 0:
+        raise CodexAdapterError(f"Codex command failed (code={returncode}): {err_text}")
+    if not out_text:
+        raise CodexAdapterError("Codex returned empty stdout.")
+    return out_text
+
+
+def _run_codex_subprocess_sync(argv: list[str], prompt: str, timeout_seconds: int) -> str:
+    started = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            argv,
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.perf_counter() - started
+        logger.error(
+            "Codex subprocess timeout (sync) elapsed_s=%.2f timeout_s=%s prompt_chars=%s argv=%r",
+            elapsed,
+            timeout_seconds,
+            len(prompt),
+            argv,
+        )
+        raise CodexAdapterError(
+            "Codex command timed out "
+            f"(timeout_s={timeout_seconds}, elapsed_s={elapsed:.2f}, "
+            f"prompt_chars={len(prompt)}, argv={argv!r})"
+        ) from exc
+    elapsed = time.perf_counter() - started
+    logger.debug(
+        "Codex subprocess done (sync) elapsed_s=%.2f prompt_chars=%s argv=%r",
+        elapsed,
+        len(prompt),
+        argv,
+    )
+    return _stdio_to_codex_result(
+        completed.stdout or b"",
+        completed.stderr or b"",
+        int(completed.returncode if completed.returncode is not None else 0),
+    )
+
+
+def _build_codex_argv(command: str, *subargs: str) -> list[str]:
+    resolved = shutil.which(command.strip()) or command
+    tail = list(subargs)
+    if sys.platform == "win32":
+        low = resolved.lower()
+        if low.endswith((".cmd", ".bat")):
+            return ["cmd.exe", "/c", resolved, *tail]
+    return [resolved, *tail]
+
+
+def _extract_usage_from_jsonl(raw: str) -> dict[str, int] | None:
+    """Extract usage counters from ``codex exec --json`` events."""
+    usage_found: dict[str, int] | None = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "turn.completed":
+            continue
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        usage_found = {
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            "cached_input_tokens": int(usage.get("cached_input_tokens", 0) or 0),
+        }
+    return usage_found
+
+
+def _extract_last_agent_message_from_jsonl(raw: str) -> str:
+    """Fallback: extract last ``agent_message`` text from ``--json`` stream."""
+    last = ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "agent_message":
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            last = text
+    return last
+
+
+@dataclass
+class LegacyCodexProvider:
+    """Run ``codex exec`` as a one-shot subprocess per prompt."""
+
+    command: str = "codex"
+    timeout_seconds: int = 180
+    retry_count: int = 1
+    model: str | None = None
+    reasoning_effort: str | None = None
+    last_exec_elapsed_s: float | None = None
+    last_prompt_chars: int | None = None
+    last_argv: tuple[str, ...] | None = None
+    last_chat_prompt_build_elapsed_s: float | None = None
+    last_chat_total_elapsed_s: float | None = None
+    last_chat_prompt_text: str | None = None
+    last_spawn_elapsed_s: float | None = None
+    last_ttft_elapsed_s: float | None = None
+    last_generation_elapsed_s: float | None = None
+    last_teardown_elapsed_s: float | None = None
+    last_input_tokens: int | None = None
+    last_output_tokens: int | None = None
+    last_cached_input_tokens: int | None = None
+
+    async def generate_plan(
+        self, question: str, schema_profile: dict, task_id: str = "unknown"
+    ) -> AnalysisPlan:
+        si = skill_instructions_for_prompt(SKILL_ANALYSIS_PLANNER, inject=True)
+        prompt = build_plan_prompt(
+            question=question,
+            schema_profile=schema_profile,
+            skill_instructions=si,
+        )
+        last_error: Exception | None = None
+        last_stdout: str | None = None
+        for _ in range(self.retry_count + 1):
+            raw: str | None = None
+            try:
+                raw = await self._run_prompt(prompt)
+                last_stdout = raw
+                payload = extract_json_payload(raw)
+                plan = AnalysisPlan.model_validate(payload)
+                save_snapshot(
+                    task_id,
+                    "codex_plan_call",
+                    {
+                        "prompt": prompt,
+                        "raw_output": raw,
+                        "parsed_result": payload,
+                        "parse_success": True,
+                    },
+                )
+                log_event(task_id, "plan", "codex_call", {"parse_success": True})
+                return plan
+            except Exception as exc:  # pragma: no cover - runtime path
+                last_error = exc
+                log_event(
+                    task_id,
+                    "plan",
+                    "codex_call",
+                    {
+                        "parse_success": False,
+                        "error": _format_exception_for_logs(exc),
+                    },
+                )
+        assert last_error is not None
+        detail = _format_exception_for_logs(last_error)
+        if last_stdout is not None:
+            detail = (
+                f"{detail}\n\n--- codex stdout (first 2000 chars) ---\n"
+                f"{last_stdout[:2000]}"
+            )
+        raise CodexAdapterError(f"Failed to generate plan:\n{detail}") from last_error
+
+    async def generate_summary(
+        self, goal: str, result_df_summary: dict, task_id: str = "unknown"
+    ) -> str:
+        prompt = build_summary_prompt(goal=goal, result_summary=result_df_summary)
+        raw = await self._run_prompt(prompt)
+        save_snapshot(
+            task_id,
+            "codex_summary_call",
+            {"prompt": prompt, "raw_output": raw, "parse_success": True},
+        )
+        log_event(task_id, "summary", "codex_call", {"parse_success": True})
+        return raw.strip()
+
+    async def generate_followups(
+        self, goal: str, result_df_summary: dict, task_id: str = "unknown"
+    ) -> list[str]:
+        prompt = build_followups_prompt(goal=goal, result_summary=result_df_summary)
+        raw = await self._run_prompt(prompt)
+        try:
+            payload = extract_json_array_payload(raw)
+            followups = [str(item) for item in payload][:3]
+        except CodexAdapterError:
+            followups = []
+        save_snapshot(
+            task_id,
+            "codex_followups_call",
+            {"prompt": prompt, "raw_output": raw, "parsed_result": followups},
+        )
+        return followups
+
+    async def chat(
+        self,
+        message: str,
+        history: list[dict],
+        file_context: dict | None,
+        task_id: str = "chat",
+    ) -> str:
+        chat_started = time.perf_counter()
+        self.last_input_tokens = None
+        self.last_output_tokens = None
+        self.last_cached_input_tokens = None
+        self.last_spawn_elapsed_s = None
+        self.last_ttft_elapsed_s = None
+        self.last_generation_elapsed_s = None
+        self.last_teardown_elapsed_s = None
+        si = skill_instructions_for_prompt(SKILL_DATA_CHAT, inject=True)
+        prompt_started = time.perf_counter()
+        prompt = build_chat_prompt(
+            message=message,
+            history=history,
+            file_context=file_context,
+            skill_instructions=si,
+        )
+        self.last_chat_prompt_text = prompt
+        self.last_chat_prompt_build_elapsed_s = time.perf_counter() - prompt_started
+        raw, usage = await self._run_prompt_with_usage(prompt)
+        if usage is not None:
+            self.last_input_tokens = usage.get("input_tokens")
+            self.last_output_tokens = usage.get("output_tokens")
+            self.last_cached_input_tokens = usage.get("cached_input_tokens")
+        save_snapshot(
+            task_id,
+            "codex_chat_call",
+            {
+                "prompt": prompt,
+                "raw_output": raw,
+                "parse_success": True,
+                "usage": usage or {},
+            },
+        )
+        log_event(task_id, "chat", "codex_call", {"parse_success": True})
+        self.last_chat_total_elapsed_s = time.perf_counter() - chat_started
+        return raw.strip()
+
+    async def revise_plan(
+        self,
+        current_plan: AnalysisPlan,
+        instruction: str,
+        schema_profile: dict,
+        task_id: str = "unknown",
+    ) -> AnalysisPlan:
+        si = skill_instructions_for_prompt(SKILL_PLAN_REVISER, inject=True)
+        prompt = build_revise_plan_prompt(
+            current_plan=current_plan.model_dump(),
+            instruction=instruction,
+            schema_profile=schema_profile,
+            skill_instructions=si,
+        )
+        last_error: Exception | None = None
+        last_stdout: str | None = None
+        for _ in range(self.retry_count + 1):
+            raw: str | None = None
+            try:
+                raw = await self._run_prompt(prompt)
+                last_stdout = raw
+                payload = extract_json_payload(raw)
+                plan = AnalysisPlan.model_validate(payload)
+                save_snapshot(
+                    task_id,
+                    "codex_revise_call",
+                    {
+                        "prompt": prompt,
+                        "raw_output": raw,
+                        "parsed_result": payload,
+                        "parse_success": True,
+                    },
+                )
+                log_event(task_id, "plan", "codex_revise", {"parse_success": True})
+                return plan
+            except Exception as exc:  # pragma: no cover - runtime path
+                last_error = exc
+                log_event(
+                    task_id,
+                    "plan",
+                    "codex_revise",
+                    {
+                        "parse_success": False,
+                        "error": _format_exception_for_logs(exc),
+                    },
+                )
+        assert last_error is not None
+        detail = _format_exception_for_logs(last_error)
+        if last_stdout is not None:
+            detail = (
+                f"{detail}\n\n--- codex stdout (first 2000 chars) ---\n"
+                f"{last_stdout[:2000]}"
+            )
+        raise CodexAdapterError(f"Failed to revise plan:\n{detail}") from last_error
+
+    async def _run_prompt_async_subprocess(self, argv: list[str], prompt: str) -> str:
+        started = time.perf_counter()
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(input=prompt.encode("utf-8")),
+                timeout=self.timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            elapsed = time.perf_counter() - started
+            logger.error(
+                "Codex subprocess timeout (async) elapsed_s=%.2f timeout_s=%s prompt_chars=%s argv=%r",
+                elapsed,
+                self.timeout_seconds,
+                len(prompt),
+                argv,
+            )
+            raise CodexAdapterError(
+                "Codex command timed out "
+                f"(timeout_s={self.timeout_seconds}, elapsed_s={elapsed:.2f}, "
+                f"prompt_chars={len(prompt)}, argv={argv!r})"
+            ) from exc
+        elapsed = time.perf_counter() - started
+        logger.debug(
+            "Codex subprocess done (async) elapsed_s=%.2f prompt_chars=%s argv=%r",
+            elapsed,
+            len(prompt),
+            argv,
+        )
+        return _stdio_to_codex_result(
+            stdout or b"",
+            stderr or b"",
+            int(process.returncode if process.returncode is not None else 0),
+        )
+
+    async def _run_prompt(self, prompt: str) -> str:
+        argv = _build_codex_argv(
+            self.command,
+            "exec",
+            *_codex_exec_config_args(
+                model_override=self.model,
+                reasoning_override=self.reasoning_effort,
+            ),
+            "-",
+        )
+        self.last_argv = tuple(argv)
+        self.last_prompt_chars = len(prompt)
+        started = time.perf_counter()
+        force_async = os.getenv("CODEX_ASYNC_SUBPROCESS", "true").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        try:
+            if sys.platform == "win32" and not force_async:
+                return await asyncio.to_thread(
+                    _run_codex_subprocess_sync, argv, prompt, self.timeout_seconds
+                )
+            try:
+                return await self._run_prompt_async_subprocess(argv, prompt)
+            except NotImplementedError:
+                return await asyncio.to_thread(
+                    _run_codex_subprocess_sync, argv, prompt, self.timeout_seconds
+                )
+        finally:
+            self.last_exec_elapsed_s = time.perf_counter() - started
+
+    async def _run_prompt_with_usage(
+        self, prompt: str
+    ) -> tuple[str, dict[str, int] | None]:
+        """Run ``codex exec --json`` and return (reply, usage tokens)."""
+        with tempfile.NamedTemporaryFile(
+            delete=False, prefix="codex-last-", suffix=".txt"
+        ) as f:
+            out_path = Path(f.name)
+        try:
+            argv = _build_codex_argv(
+                self.command,
+                "exec",
+                "--json",
+                "-o",
+                str(out_path),
+                *_codex_exec_config_args(
+                    model_override=self.model,
+                    reasoning_override=self.reasoning_effort,
+                ),
+                "-",
+            )
+            self.last_argv = tuple(argv)
+            self.last_prompt_chars = len(prompt)
+            started = time.perf_counter()
+            force_async = os.getenv("CODEX_ASYNC_SUBPROCESS", "true").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            first_event_at: float | None = None
+            turn_started_at: float | None = None
+            first_agent_at: float | None = None
+            turn_completed_at: float | None = None
+            stdout_text = ""
+            stderr_text = ""
+            returncode = 0
+            if sys.platform == "win32" and not force_async:
+                # Keep the proven sync path on Windows; detailed phase timing may be unavailable.
+                try:
+                    completed = await asyncio.to_thread(
+                        subprocess.run,
+                        argv,
+                        input=prompt.encode("utf-8"),
+                        capture_output=True,
+                        timeout=self.timeout_seconds,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    elapsed = time.perf_counter() - started
+                    raise CodexAdapterError(
+                        "Codex command timed out "
+                        f"(timeout_s={self.timeout_seconds}, elapsed_s={elapsed:.2f}, "
+                        f"prompt_chars={len(prompt)}, argv={argv!r})"
+                    ) from exc
+                stdout_text = (completed.stdout or b"").decode("utf-8", errors="ignore")
+                stderr_text = (completed.stderr or b"").decode("utf-8", errors="ignore").strip()
+                returncode = int(
+                    completed.returncode if completed.returncode is not None else 0
+                )
+            else:
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        *argv,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    assert process.stdin is not None
+                    process.stdin.write(prompt.encode("utf-8"))
+                    await process.stdin.drain()
+                    process.stdin.close()
+
+                    loop = asyncio.get_running_loop()
+                    deadline = loop.time() + float(self.timeout_seconds)
+                    lines: list[str] = []
+                    assert process.stdout is not None
+                    while True:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            process.kill()
+                            await process.wait()
+                            elapsed = time.perf_counter() - started
+                            raise CodexAdapterError(
+                                "Codex command timed out "
+                                f"(timeout_s={self.timeout_seconds}, elapsed_s={elapsed:.2f}, "
+                                f"prompt_chars={len(prompt)}, argv={argv!r})"
+                            )
+                        try:
+                            raw_line = await asyncio.wait_for(
+                                process.stdout.readline(), timeout=remaining
+                            )
+                        except asyncio.TimeoutError as exc:
+                            process.kill()
+                            await process.wait()
+                            elapsed = time.perf_counter() - started
+                            raise CodexAdapterError(
+                                "Codex command timed out "
+                                f"(timeout_s={self.timeout_seconds}, elapsed_s={elapsed:.2f}, "
+                                f"prompt_chars={len(prompt)}, argv={argv!r})"
+                            ) from exc
+                        if not raw_line:
+                            break
+                        t = time.perf_counter()
+                        if first_event_at is None:
+                            first_event_at = t
+                        line = raw_line.decode("utf-8", errors="ignore").rstrip("\r\n")
+                        lines.append(line)
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        et = event.get("type")
+                        if et == "turn.started" and turn_started_at is None:
+                            turn_started_at = t
+                        elif et == "turn.completed":
+                            turn_completed_at = t
+                        elif et == "item.completed":
+                            item = event.get("item")
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "agent_message"
+                                and first_agent_at is None
+                            ):
+                                first_agent_at = t
+
+                    remaining = max(0.0, deadline - loop.time())
+                    assert process.stderr is not None
+                    stderr_bytes = await asyncio.wait_for(
+                        process.stderr.read(), timeout=remaining if remaining > 0 else 0.01
+                    )
+                    await asyncio.wait_for(
+                        process.wait(), timeout=max(0.01, deadline - loop.time())
+                    )
+                    returncode = int(
+                        process.returncode if process.returncode is not None else 0
+                    )
+                    stdout_text = "\n".join(lines)
+                    stderr_text = (stderr_bytes or b"").decode(
+                        "utf-8", errors="ignore"
+                    ).strip()
+                except NotImplementedError:
+                    try:
+                        completed = await asyncio.to_thread(
+                            subprocess.run,
+                            argv,
+                            input=prompt.encode("utf-8"),
+                            capture_output=True,
+                            timeout=self.timeout_seconds,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        elapsed = time.perf_counter() - started
+                        raise CodexAdapterError(
+                            "Codex command timed out "
+                            f"(timeout_s={self.timeout_seconds}, elapsed_s={elapsed:.2f}, "
+                            f"prompt_chars={len(prompt)}, argv={argv!r})"
+                        ) from exc
+                    stdout_text = (completed.stdout or b"").decode(
+                        "utf-8", errors="ignore"
+                    )
+                    stderr_text = (completed.stderr or b"").decode(
+                        "utf-8", errors="ignore"
+                    ).strip()
+                    returncode = int(
+                        completed.returncode if completed.returncode is not None else 0
+                    )
+            self.last_exec_elapsed_s = time.perf_counter() - started
+            if first_event_at is not None:
+                self.last_spawn_elapsed_s = max(0.0, first_event_at - started)
+            if first_agent_at is not None:
+                base = turn_started_at or first_event_at or started
+                self.last_ttft_elapsed_s = max(0.0, first_agent_at - base)
+            if first_agent_at is not None and turn_completed_at is not None:
+                self.last_generation_elapsed_s = max(
+                    0.0, turn_completed_at - first_agent_at
+                )
+            end = time.perf_counter()
+            if turn_completed_at is not None:
+                self.last_teardown_elapsed_s = max(0.0, end - turn_completed_at)
+            if returncode != 0:
+                raise CodexAdapterError(
+                    f"Codex command failed (code={returncode}): {stderr_text}"
+                )
+            usage = _extract_usage_from_jsonl(stdout_text)
+            reply = ""
+            try:
+                reply = out_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                reply = ""
+            if not reply:
+                reply = _extract_last_agent_message_from_jsonl(stdout_text)
+            if not reply:
+                raise CodexAdapterError("Codex returned empty reply in JSON mode.")
+            return reply, usage
+        finally:
+            try:
+                out_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+_LEGACY_SINGLETON: LegacyCodexProvider | None = None
+
+
+def get_legacy_codex_provider() -> LegacyCodexProvider:
+    """Process-wide singleton for scripts expecting a stable adapter instance."""
+    global _LEGACY_SINGLETON
+    if _LEGACY_SINGLETON is None:
+        command = resolve_codex_executable()
+        timeout_seconds = int(os.getenv("CODEX_TIMEOUT_SECONDS", "180"))
+        retry_count = int(os.getenv("CODEX_RETRY_COUNT", "1"))
+        _LEGACY_SINGLETON = LegacyCodexProvider(
+            command=command,
+            timeout_seconds=timeout_seconds,
+            retry_count=retry_count,
+        )
+    return _LEGACY_SINGLETON

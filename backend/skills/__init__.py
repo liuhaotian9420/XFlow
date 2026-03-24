@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from backend.skills.native_skills import acp_agent_uses_native_skills
 from backend.skills.prompt_skills import skill_instructions_for_prompt
 from backend.skills.registry import (
     SKILL_ANALYSIS_PLANNER,
@@ -23,7 +22,6 @@ __all__ = [
     "SkillContent",
     "SkillMeta",
     "SkillRegistry",
-    "acp_agent_uses_native_skills",
     "default_project_root",
     "default_skills_root",
     "get_registry",

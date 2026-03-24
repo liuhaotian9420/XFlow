@@ -1,9 +1,4 @@
-"""Xinfei enterprise Codex install detection, CLI path resolution, and SSO checks.
-
-The Xinfei distribution ships a PowerShell/CMD wrapper (``xinfei-codex``) that is
-awkward to run from our subprocess pipeline. Prefer the real ``codex.exe`` under
-``%LOCALAPPDATA%\\Programs\\XinfeiCodex\\bin\\`` when present.
-"""
+"""Xinfei enterprise Codex install detection, CLI path resolution, and SSO checks."""
 
 from __future__ import annotations
 
@@ -35,17 +30,7 @@ def resolve_xinfei_binary() -> str | None:
 
 
 def resolve_codex_executable() -> str:
-    """Resolve the Codex CLI used for ``codex exec`` and for prepending ``PATH`` for ``codex-acp``.
-
-    Priority:
-
-    1. ``CODEX_BINARY`` — must exist as a file when set (otherwise warning + fall through).
-    2. ``CODEX_CLI_COMMAND`` — ``.exe`` path, bare name on ``PATH``, or wrapper scripts.
-       Wrapper scripts (``.cmd`` / ``.bat`` / ``.ps1``) are replaced by Xinfei's inner
-       ``codex.exe`` when detected to avoid PowerShell ``$ErrorActionPreference`` issues.
-    3. Auto-detect Xinfei default install.
-    4. ``codex`` (rely on ``PATH`` at runtime).
-    """
+    """Resolve the Codex CLI used for ``codex exec``."""
     raw_bin = os.getenv("CODEX_BINARY", "").strip()
     if raw_bin:
         p = Path(raw_bin).expanduser()
@@ -90,19 +75,9 @@ def resolve_codex_executable() -> str:
 
 
 def is_xinfei_enterprise_binary(codex_path: str) -> bool:
-    """Return True if ``codex_path`` looks like the Xinfei enterprise ``codex.exe``."""
+    """Return True if ``codex_path`` looks like Xinfei enterprise ``codex.exe``."""
     norm = codex_path.replace("\\", "/").lower()
     return "xinfeicodex" in norm
-
-
-def codex_parent_dir_for_path_prepend(codex_path: str) -> str | None:
-    """If ``codex_path`` is a concrete ``.exe`` file, return its parent for ``PATH`` prepending."""
-    if not codex_path.lower().endswith(".exe"):
-        return None
-    p = Path(codex_path)
-    if not p.is_file():
-        return None
-    return str(p.parent.resolve())
 
 
 def _combined_login_status_output(codex_bin: str) -> tuple[int, str]:
@@ -125,16 +100,13 @@ def _combined_login_status_output(codex_bin: str) -> tuple[int, str]:
 
 
 def check_enterprise_sso(codex_bin: str) -> bool:
-    """Return True if ``codex login status`` reports enterprise SSO (Xinfei-style)."""
+    """Return True if ``codex login status`` reports enterprise SSO."""
     _code, text = _combined_login_status_output(codex_bin)
     return ENTERPRISE_SSO_MARKER in text
 
 
 def ensure_enterprise_sso(codex_bin: str) -> None:
-    """Block until enterprise SSO login succeeds (may open a browser).
-
-    Opt-in via ``XINFEI_CODEX_AUTO_LOGIN=true`` from :func:`ensure_xinfei_sso_gate`.
-    """
+    """Block until enterprise SSO login succeeds (may open a browser)."""
     logger.info("Starting enterprise SSO login for %s …", codex_bin)
     proc = subprocess.run(
         [codex_bin, "login", "--enterprise-sso"],
@@ -153,14 +125,7 @@ def ensure_enterprise_sso(codex_bin: str) -> None:
 
 
 def ensure_xinfei_sso_gate(codex_bin: str) -> None:
-    """Run once per process: warn or enforce Xinfei enterprise SSO when using that binary.
-
-    Environment:
-
-    - ``XINFEI_CODEX_ENFORCE_SSO`` — if truthy and SSO is missing, raise ``RuntimeError``.
-    - ``XINFEI_CODEX_AUTO_LOGIN`` — if truthy and SSO is missing, run
-      ``codex login --enterprise-sso`` (interactive / browser).
-    """
+    """Run once per process: warn or enforce Xinfei enterprise SSO when using that binary."""
     global _sso_gate_done
     if _sso_gate_done:
         return
@@ -198,3 +163,4 @@ def ensure_xinfei_sso_gate(codex_bin: str) -> None:
     )
     if auto:
         ensure_enterprise_sso(codex_bin)
+

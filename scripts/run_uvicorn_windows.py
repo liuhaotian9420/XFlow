@@ -5,8 +5,8 @@ Use from repo root::
     uv run python scripts/run_uvicorn_windows.py          # default: host=127.0.0.1, port=8000
     uv run python scripts/run_uvicorn_windows.py --reload  # with hot-reload
 
-This avoids ``NotImplementedError`` from ``asyncio.create_subprocess_exec`` when ACP spawns
-``codex-acp`` / ``npx`` (SelectorEventLoop on Windows does not support subprocess pipes).
+This avoids ``NotImplementedError`` from ``asyncio.create_subprocess_exec`` when running
+the Codex CLI subprocess (SelectorEventLoop on Windows does not support subprocess pipes).
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def main() -> None:
         port=args.port,
         reload=args.reload,
         log_level=args.log_level,
-        loop="backend.loop_factory.proactor_loop_factory",
+        loop="backend.loop_factory:proactor_loop_factory",
     )
 
 

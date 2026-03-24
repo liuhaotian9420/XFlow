@@ -1,28 +1,25 @@
 """Custom asyncio loop factory for uvicorn on Windows.
 
-``uvicorn.loops.asyncio`` deliberately returns ``SelectorEventLoop`` when
-``use_subprocess=True`` (i.e. ``--reload``), but ``SelectorEventLoop`` does **not**
-implement ``asyncio.create_subprocess_exec`` on Windows. Our ACP layer needs that.
+On Windows + ``--reload``, forcing a Proactor loop can trigger socket accept issues
+in some environments (e.g. ``WinError 87``). For API serving stability we force a
+Selector loop for uvicorn workers.
+
+Codex subprocess execution still works because backend codex execution path has a
+synchronous subprocess fallback when async subprocess is unavailable on Selector.
 
 Usage::
 
-    uv run uvicorn backend.main:app --reload --loop backend.loop_factory.proactor_loop_factory
-
-Or via the helper script ``scripts/run_uvicorn_windows.py`` which sets the policy before
-uvicorn starts.
+    uv run uvicorn backend.main:app --reload --loop backend.loop_factory:proactor_loop_factory
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Callable
 
 
-def proactor_loop_factory(
-    use_subprocess: bool = False,  # noqa: ARG001
-) -> Callable[[], asyncio.AbstractEventLoop]:
-    """Always return ``ProactorEventLoop`` on Windows regardless of ``use_subprocess``."""
+def proactor_loop_factory() -> asyncio.AbstractEventLoop:
+    """Return an event-loop instance (required by asyncio.Runner(loop_factory=...))."""
     if sys.platform == "win32":
-        return asyncio.ProactorEventLoop
-    return asyncio.SelectorEventLoop
+        return asyncio.SelectorEventLoop()
+    return asyncio.new_event_loop()

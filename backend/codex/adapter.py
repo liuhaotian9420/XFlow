@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from backend.acp.errors import CodexAdapterError
-from backend.acp.json_util import extract_json_array_payload as _extract_json_array_payload
-from backend.acp.json_util import extract_json_payload as _extract_json_payload
-from backend.acp.legacy_codex import LegacyCodexProvider, get_legacy_codex_provider
+from backend.codex.errors import CodexAdapterError
+from backend.codex.json_util import extract_json_array_payload as _extract_json_array_payload
+from backend.codex.json_util import extract_json_payload as _extract_json_payload
+from backend.codex.legacy import LegacyCodexProvider, get_legacy_codex_provider
 
-# Historical name: always the legacy one-shot CLI adapter (see ``get_provider`` for ACP).
+# Historical name: one-shot CLI adapter.
 CodexAdapter = LegacyCodexProvider
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
+import uuid
 from typing import Any
 
 import pandas as pd
@@ -27,11 +29,17 @@ def _init_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("file_meta", None)
     st.session_state.setdefault("task_history", [])
+    st.session_state.setdefault("chat_sessions_cache", [])
+    st.session_state.setdefault("task_history_cache", [])
     st.session_state.setdefault("_followup_q", None)
     st.session_state.setdefault("mode", "chat")  # "chat" | "task"
+    st.session_state.setdefault("chat_session_id", str(uuid.uuid4()))
     st.session_state.setdefault("active_task_id", None)
     st.session_state.setdefault("schema_profile", None)
     st.session_state.setdefault("schema_profile_for", None)
+    st.session_state.setdefault("codex_model_override", "")
+    st.session_state.setdefault("codex_reasoning_effort_override", "")
+    st.session_state.setdefault("show_prompt_debug", False)
     if "use_codex_mock" not in st.session_state:
         st.session_state.use_codex_mock = _default_use_codex_mock()
 
@@ -97,6 +105,15 @@ def _pending_plan_task_id() -> str | None:
 
 def _chat_history_upto(before_index: int) -> list[dict[str, str]]:
     """Build {role, content} history for POST /chat from prior transcript turns."""
+    def _sanitize_assistant_content(text: str) -> str:
+        lines = text.splitlines()
+        kept: list[str] = []
+        for line in lines:
+            if "[Timing]" in line or "[Tokens]" in line:
+                continue
+            kept.append(line)
+        return "\n".join(kept).strip()
+
     hist: list[dict[str, str]] = []
     for msg in st.session_state.messages[:before_index]:
         role = msg.get("role", "user")
@@ -106,7 +123,7 @@ def _chat_history_upto(before_index: int) -> list[dict[str, str]]:
         if mtype == "text":
             content = (msg.get("content") or "").strip()
         elif mtype == "chat_response":
-            content = (msg.get("content") or "").strip()
+            content = _sanitize_assistant_content((msg.get("content") or "").strip())
         else:
             continue
         if content:
@@ -149,7 +166,16 @@ def _requests_error_message(exc: requests.RequestException) -> str:
 def _codex_mock_query_params() -> dict[str, str]:
     """Query string survives multipart POST reliably; form fields beside file uploads may not."""
     use_mock = bool(st.session_state.get("use_codex_mock", True))
-    return {"use_mock": "true" if use_mock else "false"}
+    params: dict[str, str] = {"use_mock": "true" if use_mock else "false"}
+    model = str(st.session_state.get("codex_model_override", "") or "").strip()
+    reasoning = str(
+        st.session_state.get("codex_reasoning_effort_override", "") or ""
+    ).strip()
+    if model:
+        params["model"] = model
+    if reasoning:
+        params["reasoning_effort"] = reasoning
+    return params
 
 
 def _post_task_bytes(
@@ -194,22 +220,72 @@ def _get_result(task_id: str) -> dict[str, Any]:
     return response.json()
 
 
+def _get_chat_sessions(limit: int = 50) -> list[dict[str, Any]]:
+    response = requests.get(_api_url("/chat/sessions"), params={"limit": limit}, timeout=30)
+    response.raise_for_status()
+    return list(response.json() or [])
+
+
+def _get_chat_session_turns(session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    response = requests.get(
+        _api_url(f"/chat/sessions/{session_id}/turns"),
+        params={"limit": limit},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return list(response.json() or [])
+
+
+def _delete_chat_session(session_id: str) -> int:
+    response = requests.delete(_api_url(f"/chat/sessions/{session_id}"), timeout=30)
+    response.raise_for_status()
+    body = response.json() or {}
+    return int(body.get("deleted", 0) or 0)
+
+
+def _delete_all_chat_sessions() -> int:
+    response = requests.delete(_api_url("/chat/sessions"), timeout=30)
+    response.raise_for_status()
+    body = response.json() or {}
+    return int(body.get("deleted", 0) or 0)
+
+
+def _get_task_history(limit: int = 50) -> list[dict[str, Any]]:
+    response = requests.get(_api_url("/tasks/history"), params={"limit": limit}, timeout=30)
+    response.raise_for_status()
+    return list(response.json() or [])
+
+
+def _delete_task(task_id: str) -> int:
+    response = requests.delete(_api_url(f"/tasks/{task_id}"), timeout=30)
+    response.raise_for_status()
+    body = response.json() or {}
+    return int(body.get("deleted", 0) or 0)
+
+
 def _post_chat(message: str, history: list[dict[str, str]], file_context: dict | None) -> dict[str, Any]:
     use_mock = bool(st.session_state.get("use_codex_mock", True))
-    # Real Codex / ACP / npx cold start can exceed 120s.
+    # Real Codex CLI cold start can exceed 120s.
     timeout_s = 120 if use_mock else int(os.getenv("STREAMLIT_CHAT_TIMEOUT_SECONDS", "300"))
+    started = time.perf_counter()
+    params = _codex_mock_query_params()
+    if bool(st.session_state.get("show_prompt_debug", False)):
+        params["include_prompt_debug"] = "true"
     response = requests.post(
         _api_url("/chat"),
         json={
             "message": message,
+            "session_id": st.session_state.get("chat_session_id"),
             "history": history,
             "file_context": file_context,
         },
-        params=_codex_mock_query_params(),
+        params=params,
         timeout=timeout_s,
     )
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    payload["_client_elapsed_s"] = time.perf_counter() - started
+    return payload
 
 
 def _post_revise(task_id: str, instruction: str) -> dict[str, Any]:
@@ -302,6 +378,36 @@ def _append_task_history(task_id: str, question: str) -> None:
     st.session_state.task_history = hist[-20:]
 
 
+def _restore_chat_messages_from_turns(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    restored: list[dict[str, Any]] = []
+    for turn in turns:
+        user_message = str(turn.get("user_message") or "").strip()
+        if user_message:
+            restored.append({"role": "user", "type": "text", "content": user_message})
+        reply_text = str(turn.get("reply_text") or "").strip()
+        if reply_text:
+            restored.append(
+                {
+                    "role": "assistant",
+                    "type": "chat_response",
+                    "content": reply_text,
+                    "debug_prompt": turn.get("debug_prompt"),
+                    "prompt_chars": turn.get("prompt_chars"),
+                    "history_turns_used": turn.get("history_turns"),
+                }
+            )
+        error_text = str(turn.get("error_text") or "").strip()
+        if error_text and not reply_text:
+            restored.append(
+                {
+                    "role": "assistant",
+                    "type": "text",
+                    "content": f"**Chat failed:** {error_text}",
+                }
+            )
+    return restored
+
+
 def _enqueue_task(question: str) -> None:
     """Append a 'thinking' placeholder; actual API call happens on next render."""
     meta = st.session_state.file_meta
@@ -376,6 +482,7 @@ def _execute_create_task(msg: dict[str, Any], msg_index: int) -> None:
         }
         st.session_state.active_task_id = tid
         _append_task_history(tid, question)
+        st.session_state.task_history_cache = []
     except requests.RequestException as exc:
         detail = _requests_error_message(exc)
         use_mock = bool(st.session_state.get("use_codex_mock", True))
@@ -441,11 +548,81 @@ def _execute_chat_reply(msg: dict[str, Any], msg_index: int) -> None:
     try:
         with st.spinner("Thinking…"):
             resp = _post_chat(user_text, history, file_ctx)
+        session_id = resp.get("session_id")
+        if isinstance(session_id, str) and session_id.strip():
+            st.session_state.chat_session_id = session_id.strip()
+            st.session_state.chat_sessions_cache = []
         reply = resp.get("reply", "").strip() or "(empty reply)"
+        prompt_chars = resp.get("prompt_chars")
+        history_turns_used = resp.get("history_turns_used")
+        debug_prompt = resp.get("debug_prompt")
+        codex_elapsed = resp.get("codex_exec_elapsed_s")
+        codex_spawn_elapsed = resp.get("codex_spawn_elapsed_s")
+        codex_ttft_elapsed = resp.get("codex_ttft_elapsed_s")
+        codex_generation_elapsed = resp.get("codex_generation_elapsed_s")
+        codex_teardown_elapsed = resp.get("codex_teardown_elapsed_s")
+        provider_elapsed = resp.get("provider_elapsed_s")
+        provider_overhead_elapsed = resp.get("provider_overhead_elapsed_s")
+        prompt_build_elapsed = resp.get("prompt_build_elapsed_s")
+        input_tokens = resp.get("input_tokens")
+        output_tokens = resp.get("output_tokens")
+        cached_input_tokens = resp.get("cached_input_tokens")
+        api_elapsed = resp.get("api_elapsed_s")
+        client_elapsed = resp.get("_client_elapsed_s")
+        timing_parts: list[str] = []
+        if isinstance(codex_elapsed, (int, float)):
+            timing_parts.append(f"codex执行 {codex_elapsed:.2f}s")
+        timing_parts.append(
+            f"spawn {codex_spawn_elapsed:.2f}s"
+            if isinstance(codex_spawn_elapsed, (int, float))
+            else "spawn n/a"
+        )
+        timing_parts.append(
+            f"首token {codex_ttft_elapsed:.2f}s"
+            if isinstance(codex_ttft_elapsed, (int, float))
+            else "首token n/a"
+        )
+        timing_parts.append(
+            f"生成 {codex_generation_elapsed:.2f}s"
+            if isinstance(codex_generation_elapsed, (int, float))
+            else "生成 n/a"
+        )
+        timing_parts.append(
+            f"收尾 {codex_teardown_elapsed:.2f}s"
+            if isinstance(codex_teardown_elapsed, (int, float))
+            else "收尾 n/a"
+        )
+        if isinstance(provider_overhead_elapsed, (int, float)):
+            timing_parts.append(f"后端非Codex {provider_overhead_elapsed:.2f}s")
+        if isinstance(prompt_build_elapsed, (int, float)):
+            timing_parts.append(f"组Prompt {prompt_build_elapsed:.2f}s")
+        if isinstance(provider_elapsed, (int, float)):
+            timing_parts.append(f"后端总计 {provider_elapsed:.2f}s")
+        if isinstance(client_elapsed, (int, float)):
+            timing_parts.append(f"接口通讯 {client_elapsed:.2f}s")
+        elif isinstance(api_elapsed, (int, float)):
+            timing_parts.append(f"接口通讯 {api_elapsed:.2f}s")
+        if timing_parts:
+            reply = (
+                f"{reply}\n\n"
+                f"`[Timing] {' | '.join(timing_parts)}（后端总计与接口通讯包含 codex执行，勿相加）`"
+            )
+        token_parts: list[str] = []
+        if isinstance(input_tokens, int):
+            token_parts.append(f"in {input_tokens}")
+        if isinstance(output_tokens, int):
+            token_parts.append(f"out {output_tokens}")
+        if isinstance(cached_input_tokens, int):
+            token_parts.append(f"cached_in {cached_input_tokens}")
+        if token_parts:
+            reply = f"{reply}\n\n`[Tokens] {' | '.join(token_parts)}`"
         st.session_state.messages[msg_index] = {
             "role": "assistant",
             "type": "chat_response",
             "content": reply,
+            "debug_prompt": debug_prompt,
+            "prompt_chars": prompt_chars,
+            "history_turns_used": history_turns_used,
         }
     except requests.RequestException as exc:
         st.session_state.messages[msg_index] = {
@@ -502,6 +679,7 @@ with st.sidebar:
             else ""
         )
     )
+    st.caption(f"session `{str(st.session_state.get('chat_session_id', ''))[:8]}…`")
 
     st.subheader("Data file")
     if st.session_state.file_meta:
@@ -519,17 +697,99 @@ with st.sidebar:
         key="use_codex_mock",
         help="When off, the API uses the real Codex CLI for plan / summary / follow-ups (same as CODEX_MOCK=false).",
     )
+    st.toggle(
+        "Show Prompt Debug",
+        key="show_prompt_debug",
+        help="Show a collapsed panel under each chat response with the exact prompt sent to Codex.",
+    )
+    st.text_input(
+        "Model Override",
+        key="codex_model_override",
+        placeholder="e.g. gpt-5.4-mini",
+        help="Optional per-request model override sent to backend as query param `model`.",
+    )
+    st.text_input(
+        "Reasoning Effort",
+        key="codex_reasoning_effort_override",
+        placeholder="low / medium / high",
+        help="Optional per-request reasoning override sent as `reasoning_effort`.",
+    )
+
+    st.divider()
+    st.subheader("Chat sessions")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Refresh sessions", key="refresh_chat_sessions"):
+            try:
+                st.session_state.chat_sessions_cache = _get_chat_sessions(limit=50)
+            except requests.RequestException as exc:
+                st.error(_requests_error_message(exc))
+    with c2:
+        if st.button("Delete all sessions", key="delete_all_chat_sessions"):
+            try:
+                _delete_all_chat_sessions()
+                st.session_state.chat_sessions_cache = []
+                st.session_state.messages = []
+                st.session_state.chat_session_id = str(uuid.uuid4())
+                st.rerun()
+            except requests.RequestException as exc:
+                st.error(_requests_error_message(exc))
+    if not st.session_state.chat_sessions_cache:
+        try:
+            st.session_state.chat_sessions_cache = _get_chat_sessions(limit=50)
+        except requests.RequestException:
+            st.caption("No session history yet.")
+    if not st.session_state.chat_sessions_cache:
+        st.caption("No session history yet.")
+    else:
+        for item in st.session_state.chat_sessions_cache:
+            sid = str(item.get("session_id") or "")
+            turn_count = int(item.get("turn_count") or 0)
+            st.caption(f"`{sid[:8]}…` · {turn_count} turns")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Load", key=f"load_chat_session_{sid}"):
+                    try:
+                        turns = _get_chat_session_turns(sid, limit=200)
+                        st.session_state.messages = _restore_chat_messages_from_turns(turns)
+                        st.session_state.chat_session_id = sid
+                        st.session_state.mode = "chat"
+                        st.rerun()
+                    except requests.RequestException as exc:
+                        st.error(_requests_error_message(exc))
+            with c2:
+                if st.button("Delete", key=f"delete_chat_session_{sid}"):
+                    try:
+                        _delete_chat_session(sid)
+                        if st.session_state.get("chat_session_id") == sid:
+                            st.session_state.chat_session_id = str(uuid.uuid4())
+                            st.session_state.messages = []
+                        st.session_state.chat_sessions_cache = _get_chat_sessions(limit=50)
+                        st.rerun()
+                    except requests.RequestException as exc:
+                        st.error(_requests_error_message(exc))
 
     st.divider()
     st.subheader("Recent tasks")
-    if not st.session_state.task_history:
+    if st.button("Refresh tasks", key="refresh_task_history"):
+        try:
+            st.session_state.task_history_cache = _get_task_history(limit=50)
+        except requests.RequestException as exc:
+            st.error(_requests_error_message(exc))
+    if not st.session_state.task_history_cache:
+        try:
+            st.session_state.task_history_cache = _get_task_history(limit=50)
+        except requests.RequestException:
+            st.caption("None yet.")
+    if not st.session_state.task_history_cache:
         st.caption("None yet.")
     else:
-        for i, item in enumerate(reversed(st.session_state.task_history)):
-            tid = item["task_id"]
-            label = item["question"][:40] + ("…" if len(item["question"]) > 40 else "")
+        for item in st.session_state.task_history_cache:
+            tid = str(item.get("task_id") or "")
+            label = str(item.get("question") or "")
+            label = label[:40] + ("…" if len(label) > 40 else "")
             st.caption(f"`{tid[:8]}…` {label}")
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 if st.button("Refresh", key=f"hist_ref_{tid}"):
                     try:
@@ -542,7 +802,7 @@ with st.sidebar:
                         )
                         st.rerun()
                     except requests.RequestException as exc:
-                        st.error(str(exc))
+                        st.error(_requests_error_message(exc))
             with c2:
                 if st.button("Result", key=f"hist_res_{tid}"):
                     try:
@@ -557,12 +817,21 @@ with st.sidebar:
                         )
                         st.rerun()
                     except requests.RequestException as exc:
-                        st.error(str(exc))
+                        st.error(_requests_error_message(exc))
+            with c3:
+                if st.button("Delete", key=f"hist_del_{tid}"):
+                    try:
+                        _delete_task(tid)
+                        st.session_state.task_history_cache = _get_task_history(limit=50)
+                        st.rerun()
+                    except requests.RequestException as exc:
+                        st.error(_requests_error_message(exc))
 
     if st.button("Clear chat history"):
         st.session_state.messages = []
         st.session_state.mode = "chat"
         st.session_state.active_task_id = None
+        st.session_state.chat_session_id = str(uuid.uuid4())
         st.rerun()
 
 # --- Process follow-up click (before rendering chat) ---
@@ -604,6 +873,19 @@ for i, msg in enumerate(st.session_state.messages):
             st.markdown(msg.get("content", ""))
         elif mtype == "chat_response":
             st.markdown(msg.get("content", ""))
+            debug_prompt = msg.get("debug_prompt")
+            if isinstance(debug_prompt, str) and debug_prompt.strip():
+                with st.expander("Context sent to Codex"):
+                    pchars = msg.get("prompt_chars")
+                    hturns = msg.get("history_turns_used")
+                    meta_parts: list[str] = []
+                    if isinstance(pchars, int):
+                        meta_parts.append(f"prompt_chars={pchars}")
+                    if isinstance(hturns, int):
+                        meta_parts.append(f"history_turns={hturns}")
+                    if meta_parts:
+                        st.caption(" | ".join(meta_parts))
+                    st.code(debug_prompt, language="markdown")
         elif mtype == "plan_review":
             task_id = msg["task_id"]
             plan = msg["plan"]
