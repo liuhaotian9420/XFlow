@@ -15,7 +15,7 @@ $env:API_BASE_URL = $ApiBaseUrl
 $projectRoot = (Get-Location).Path
 
 Start-Process powershell -ArgumentList "-NoExit", "-Command", @"
-Set-Location '$projectRoot'; `$env:CODEX_MOCK='$CodexMock'; `$env:API_BASE_URL='$ApiBaseUrl'; uv run uvicorn backend.main:app --reload
+Set-Location '$projectRoot'; `$env:CODEX_MOCK='$CodexMock'; `$env:API_BASE_URL='$ApiBaseUrl'; uv run uvicorn backend.main:app --reload --loop backend.loop_factory.proactor_loop_factory
 "@
 Start-Process powershell -ArgumentList "-NoExit", "-Command", @"
 Set-Location '$projectRoot'; `$env:CODEX_MOCK='$CodexMock'; `$env:API_BASE_URL='$ApiBaseUrl'; uv run streamlit run app/streamlit_app.py

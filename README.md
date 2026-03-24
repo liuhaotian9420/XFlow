@@ -21,8 +21,16 @@ This installs Python dependencies including **`agent-client-protocol`** (import 
 ### 2. Start the backend (terminal 1)
 
 ```bash
+# macOS / Linux
 uv run uvicorn backend.main:app --reload
+
+# Windows (required for ACP — forces ProactorEventLoop so subprocess pipes work)
+uv run uvicorn backend.main:app --reload --loop backend.loop_factory.proactor_loop_factory
+# … or equivalently:
+uv run python scripts/run_uvicorn_windows.py --reload
 ```
+
+> **Why?** uvicorn's default loop factory returns `SelectorEventLoop` on Windows when `--reload` is active, and `SelectorEventLoop` does not implement `create_subprocess_exec`. The custom loop factory in `backend/loop_factory.py` always returns `ProactorEventLoop`.
 
 Backend: `http://127.0.0.1:8000` · Swagger: `http://127.0.0.1:8000/docs`
 
@@ -71,12 +79,21 @@ Results     →  chart + table + summary + follow-up chips (can spawn another `/
 | Provider | When | Notes |
 |----------|------|--------|
 | **MockProvider** | `CODEX_MOCK=true` (default) | No CLI; deterministic plans and canned chat. |
-| **AcpProvider** | `CODEX_MOCK=false`, ACP agent on `PATH`, `ACP_BACKEND` not forced to legacy | Long-lived stdio JSON-RPC to `ACP_AGENT_COMMAND` (default `codex-acp`). One subprocess per API process; logical sessions per `task_id` and a shared chat key. |
-| **LegacyCodexProvider** | `CODEX_MOCK=false` but no ACP binary or `ACP_BACKEND=legacy` | One-shot `codex exec` per call (previous behavior). |
+| **AcpProvider** | `CODEX_MOCK=false`, ACP launcher on `PATH`, `ACP_BACKEND` not forced to legacy | Long-lived stdio JSON-RPC to `codex-acp` (or `npx -y @zed-industries/codex-acp` if `codex-acp` is missing). The child `codex` used by the adapter is **`resolve_codex_executable()`** (Xinfei `codex.exe` auto-detected on Windows when unset). |
+| **LegacyCodexProvider** | `CODEX_MOCK=false` but no ACP launcher or `ACP_BACKEND=legacy` | One-shot `codex exec` per call via the same resolved Codex binary. |
 
 Skills under `.agents/skills/` are discovered by Codex when **ACP session `cwd`** points at the repo (see `ACP_SESSION_CWD`). Non-Codex agents get skill bodies **injected** into prompts unless `ACP_AGENT_NATIVE_SKILLS` disables injection.
 
 Full detail: [`docs/architecture.md`](docs/architecture.md).
+
+---
+
+## Xinfei enterprise Codex (Windows)
+
+If **Xinfei Codex** is installed under `%LOCALAPPDATA%\Programs\XinfeiCodex\bin\codex.exe`, the backend **prefers that binary** over `codex` on `PATH` when `CODEX_BINARY` and `CODEX_CLI_COMMAND` are unset. This avoids invoking `xinfei-codex.cmd` / `.ps1` from subprocesses (PowerShell `Stop` on `login status` stderr).
+
+- **ACP:** `codex-acp` (or `npx`) spawns `codex` from `PATH`; we prepend the resolved `codex.exe` directory to the agent subprocess `PATH` so the enterprise binary wins.
+- **SSO:** On first real (non-mock) request, if the resolved binary is under `XinfeiCodex`, we check `codex login status` for `Logged in using Enterprise SSO`. If missing, we **log a warning** unless `XINFEI_CODEX_ENFORCE_SSO=true` (fail fast) or `XINFEI_CODEX_AUTO_LOGIN=true` (run `codex login --enterprise-sso`).
 
 ---
 
@@ -85,16 +102,23 @@ Full detail: [`docs/architecture.md`](docs/architecture.md).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CODEX_MOCK` | `true` | `true` = MockProvider; `false` = real LLM path (ACP if available, else legacy `codex exec`). |
-| `CODEX_CLI_COMMAND` | `codex` | Legacy provider only: Codex CLI binary. |
+| `CODEX_BINARY` | *(auto)* | Absolute path to `codex.exe` / `codex`. Overrides auto-detection and is used for legacy `exec` and for ACP `PATH` prepending. |
+| `CODEX_CLI_COMMAND` | *(unset → auto)* | If set: command or path passed to legacy `exec` resolution. Shell wrappers (`.cmd`/`.bat`/`.ps1`) are replaced by Xinfei's inner `codex.exe` when detected. |
 | `CODEX_TIMEOUT_SECONDS` | `60` | Legacy default; ACP manager may use the same env where applicable. |
 | `CODEX_RETRY_COUNT` | `1` | Retries on plan / revise parse failures. |
 | `CODEX_AUTO_MOCK_THRESHOLD` | `3` | Consecutive failures → auto mock for process lifetime. |
 | `CODEX_HTTP_TRANSPORT_ONLY` | `true` | Legacy Codex: prefer HTTP/SSE provider vs WebSocket (see architecture doc). |
 | `CODEX_SSE_PROVIDER_ID` | `openai_sse` | Synthetic provider id for `-c` overrides. |
 | `CODEX_EXTRA_CONFIG` | *(empty)* | Extra `codex -c` pairs, semicolon-separated. |
-| `ACP_AGENT_COMMAND` | `codex-acp` | ACP agent executable when on `PATH`. |
+| `ACP_AGENT_COMMAND` | *(auto)* | If unset: use `codex-acp` when on `PATH`, else `npx -y @zed-industries/codex-acp`. Set explicitly to override (e.g. a full path to `codex-acp.exe`). |
 | `ACP_AGENT_ARGS` | *(empty)* | Extra args (shell-tokenized). |
+| `ACP_AGENT_PATH_PREPEND` | `true` | If not `false`/`0`/`off`, prepend the parent directory of `resolve_codex_executable()` to the ACP agent `PATH` (so `codex-acp` picks Xinfei Codex). |
+| `ACP_AGENT_INHERIT_FULL_ENV` | `true` | If not `false`/`0`/`off`, the ACP subprocess receives the **full** backend `os.environ` (same idea as your terminal), not only the SDK’s trimmed set — fixes many `502` / auth / `npx` issues. |
+| `ACP_AGENT_STDERR` | `inherit` | `inherit` (default): child stderr goes to the API process (see logs next to uvicorn). `null`/`devnull`: discard. `pipe`: SDK default — if nothing reads stderr and the agent is verbose, the pipe can **fill and block** (UI stuck on “Thinking…”). |
+| `STREAMLIT_CHAT_TIMEOUT_SECONDS` | `300` | Streamlit → `/chat` timeout when mock is off (seconds). |
 | `ACP_BACKEND` | *(auto)* | `legacy` / `exec` / `codex-exec` forces legacy despite ACP binary. |
+| `XINFEI_CODEX_ENFORCE_SSO` | `false` | If truthy and Xinfei binary is not in enterprise SSO state, raise at startup of first real request. |
+| `XINFEI_CODEX_AUTO_LOGIN` | `false` | If truthy and SSO missing, run `codex login --enterprise-sso` (interactive / browser). |
 | `ACP_CHAT_SESSION_KEY` | `xyf-global-chat` | Logical session key for `POST /chat` continuity. |
 | `ACP_SESSION_CWD` | *(repo root)* | `session/new` working directory so Codex loads `.agents/skills` and `AGENTS.md`. |
 | `ACP_AGENT_NATIVE_SKILLS` | *(auto)* | `true`/`false` overrides prompt injection; unset → skip injection if command contains `codex`. |
@@ -117,7 +141,10 @@ Repository skills use the **Codex / agentskills** layout: each folder contains `
 |---------|----------------|-----|
 | `ModuleNotFoundError: No module named 'acp'` | Dependencies not installed | Run `uv sync` from repo root; use `uv run …` so the project venv is active. |
 | `ImportError: ACP mode requires 'agent-client-protocol'` | Mock off but SDK missing | `uv sync` or `pip install 'agent-client-protocol>=0.8.1'`. |
-| Backend starts but ACP calls fail | Agent binary missing | Install `codex-acp` (or your agent) on `PATH`, or set `ACP_BACKEND=legacy`. |
+| Backend starts but ACP calls fail | Agent binary missing | Install `codex-acp` (`npm i -g @zed-industries/codex-acp`) or ensure `npx` is on `PATH` (default falls back to `npx -y @zed-industries/codex-acp`), or set `ACP_BACKEND=legacy`. |
+| Legacy / ACP fails right after Xinfei install | Wrapper + SSO stderr | Set `CODEX_BINARY` to `%LOCALAPPDATA%\Programs\XinfeiCodex\bin\codex.exe` or leave env unset for auto-detect; do not point `CODEX_CLI_COMMAND` at `xinfei-codex.cmd` unless you accept wrapper behavior. |
+| ACP fails with `NotImplementedError` in `create_subprocess_exec` (Windows) | uvicorn `--reload` forces `SelectorEventLoop` which lacks subprocess pipes. | Use `--loop backend.loop_factory.proactor_loop_factory` on the uvicorn command, or run `uv run python scripts/run_uvicorn_windows.py --reload`, or set **`ACP_BACKEND=legacy`**. |
+| Streamlit stuck on “Thinking…” (real mode) | Long model run, or **stderr pipe deadlock** (`ACP_AGENT_STDERR=pipe`), or waiting on first `npx` download | Run uvicorn with **`--log-level debug`** and watch for `CHAT begin`, `ACP spawning agent`, `ACP prompt start/end`. Keep **`ACP_AGENT_STDERR=inherit`** (default). Increase `CODEX_TIMEOUT_SECONDS` / `STREAMLIT_CHAT_TIMEOUT_SECONDS` if needed. |
 | Codex ignores skills | Wrong `cwd` | Set `ACP_SESSION_CWD` to the repo root (absolute path). |
 
 ---
@@ -166,7 +193,7 @@ xyf-competition-mvp/
 │   ├── main.py                 # FastAPI + lifespan → shutdown_providers()
 │   ├── storage.py
 │   ├── observability.py
-│   ├── acp/                    # ACP client, providers, factory, legacy exec shim
+│   ├── acp/                    # ACP client, providers, factory, legacy exec, Xinfei/CLI resolution
 │   ├── skills/                 # SkillRegistry, native-skill detection, prompt injection
 │   ├── routers/
 │   │   ├── tasks.py            # /tasks/*

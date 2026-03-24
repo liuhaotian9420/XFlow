@@ -195,6 +195,9 @@ def _get_result(task_id: str) -> dict[str, Any]:
 
 
 def _post_chat(message: str, history: list[dict[str, str]], file_context: dict | None) -> dict[str, Any]:
+    use_mock = bool(st.session_state.get("use_codex_mock", True))
+    # Real Codex / ACP / npx cold start can exceed 120s.
+    timeout_s = 120 if use_mock else int(os.getenv("STREAMLIT_CHAT_TIMEOUT_SECONDS", "300"))
     response = requests.post(
         _api_url("/chat"),
         json={
@@ -203,7 +206,7 @@ def _post_chat(message: str, history: list[dict[str, str]], file_context: dict |
             "file_context": file_context,
         },
         params=_codex_mock_query_params(),
-        timeout=120,
+        timeout=timeout_s,
     )
     response.raise_for_status()
     return response.json()

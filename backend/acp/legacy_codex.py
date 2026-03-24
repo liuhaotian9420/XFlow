@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from backend.acp.errors import CodexAdapterError
 from backend.acp.json_util import extract_json_array_payload, extract_json_payload
+from backend.acp.xinfei_sso import resolve_codex_executable
 from backend.skills import (
     SKILL_ANALYSIS_PLANNER,
     SKILL_DATA_CHAT,
@@ -347,7 +348,7 @@ def get_legacy_codex_provider() -> LegacyCodexProvider:
     """Process-wide singleton for scripts that expect a stable ``get_adapter()`` instance."""
     global _LEGACY_SINGLETON
     if _LEGACY_SINGLETON is None:
-        command = os.getenv("CODEX_CLI_COMMAND", "codex")
+        command = resolve_codex_executable()
         timeout_seconds = int(os.getenv("CODEX_TIMEOUT_SECONDS", "60"))
         retry_count = int(os.getenv("CODEX_RETRY_COUNT", "1"))
         _LEGACY_SINGLETON = LegacyCodexProvider(

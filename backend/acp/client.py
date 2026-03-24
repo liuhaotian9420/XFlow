@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import tempfile
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +44,21 @@ class _AcpRuntime:
 
 
 _acp_cached: _AcpRuntime | None = None
+
+
+def _acp_stderr_transport_kwargs() -> dict[str, Any]:
+    """Map ``ACP_AGENT_STDERR`` to ``spawn_stdio_transport`` kwargs.
+
+    The SDK defaults to ``stderr=PIPE``. If the agent is chatty on stderr and nothing
+    drains the pipe, the child **blocks** and the client looks stuck on "Thinking…".
+    """
+    raw = os.getenv("ACP_AGENT_STDERR", "inherit").strip().lower()
+    if raw in ("pipe", "1", "true", "yes"):
+        return {}
+    if raw in ("null", "none", "discard", "devnull"):
+        return {"stderr": asyncio.subprocess.DEVNULL}
+    # inherit parent's stderr → logs appear next to uvicorn; avoids pipe deadlock
+    return {"stderr": None}
 
 
 def _load_acp() -> _AcpRuntime:
@@ -129,6 +147,12 @@ class AnalysisAcpClient:
             content = update.content
             if hasattr(content, "text") and isinstance(content.text, str):
                 self._chunks.append(content.text)
+        else:
+            logger.debug(
+                "ACP session_update session_id=%s type=%s",
+                session_id[:16] if session_id else "",
+                type(update).__name__,
+            )
 
     async def read_text_file(
         self,
@@ -189,6 +213,11 @@ class AcpSessionManager:
         self._ensure_lock = asyncio.Lock()
         self._prompt_lock = asyncio.Lock()
 
+    @property
+    def spawn_argv(self) -> tuple[str, ...]:
+        """ACP launcher argv (for logs): e.g. ``npx``, ``-y``, ``@zed-industries/codex-acp``."""
+        return (self._agent_command, *self._agent_args)
+
     async def aclose(self) -> None:
         """Close JSON-RPC connection and terminate the agent subprocess."""
         self._sessions.clear()
@@ -209,15 +238,50 @@ class AcpSessionManager:
             self._stack = AsyncExitStack()
             assert self._stack is not None
             try:
+                argv = (self._agent_command, *self._agent_args)
+                tk = _acp_stderr_transport_kwargs()
+                logger.info(
+                    "ACP spawning agent argv=%s cwd=%s stderr_mode=%s",
+                    argv,
+                    self._subprocess_cwd,
+                    "pipe(default-sdk)"
+                    if not tk
+                    else ("inherit" if tk.get("stderr") is None else "DEVNULL"),
+                )
+                t0 = time.perf_counter()
                 cm = a.spawn_agent_process(
                     self._client,
                     self._agent_command,
                     *self._agent_args,
                     env=self._extra_env if self._extra_env else None,
                     cwd=self._subprocess_cwd,
+                    transport_kwargs=tk or None,
                 )
                 self._conn, _proc = await self._stack.enter_async_context(cm)
                 await self._conn.initialize(protocol_version=a.PROTOCOL_VERSION)
+                dt = time.perf_counter() - t0
+                pid = getattr(_proc, "pid", None)
+                logger.info(
+                    "ACP agent ready pid=%s initialize_ok in %.2fs",
+                    pid,
+                    dt,
+                )
+            except NotImplementedError as exc:
+                await self._stack.aclose()
+                self._stack = None
+                self._conn = None
+                if sys.platform == "win32":
+                    loop = asyncio.get_running_loop()
+                    raise CodexAdapterError(
+                        "ACP cannot spawn a subprocess on this Windows asyncio loop "
+                        f"({type(loop).__name__}). asyncio.create_subprocess_exec is only "
+                        "implemented on WindowsProactorEventLoop. Ensure the backend package "
+                        "is imported as ``backend`` (so ``backend/__init__.py`` sets "
+                        "WindowsProactorEventLoopPolicy before the loop starts), restart "
+                        "uvicorn without an alternate entry that skips that import, or set "
+                        "ACP_BACKEND=legacy to use ``codex exec`` instead."
+                    ) from exc
+                raise
             except Exception:
                 await self._stack.aclose()
                 self._stack = None
@@ -232,9 +296,27 @@ class AcpSessionManager:
             self._client.reset_turn_buffer()
             assert self._conn is not None
             if logical_session_key not in self._sessions:
+                logger.info(
+                    "ACP new_session logical_key=%r cwd=%s",
+                    logical_session_key,
+                    self._session_cwd,
+                )
+                t_ns = time.perf_counter()
                 resp = await self._conn.new_session(cwd=self._session_cwd, mcp_servers=[])
                 self._sessions[logical_session_key] = resp.session_id
+                logger.info(
+                    "ACP new_session done session_id=%s in %.2fs",
+                    resp.session_id[:16] if resp.session_id else "",
+                    time.perf_counter() - t_ns,
+                )
             sid = self._sessions[logical_session_key]
+            logger.info(
+                "ACP prompt start session=%s… prompt_chars=%s timeout_s=%s",
+                sid[:16] if sid else "",
+                len(user_text),
+                self._timeout,
+            )
+            t_prompt = time.perf_counter()
             try:
                 await asyncio.wait_for(
                     self._conn.prompt(
@@ -244,10 +326,22 @@ class AcpSessionManager:
                     timeout=self._timeout,
                 )
             except asyncio.TimeoutError as exc:
+                logger.error(
+                    "ACP prompt TIMEOUT after %ss session=%s…",
+                    self._timeout,
+                    sid[:16] if sid else "",
+                )
                 raise CodexAdapterError(
                     f"ACP prompt timed out after {self._timeout}s"
                 ) from exc
+            dt = time.perf_counter() - t_prompt
             text = self._client.get_turn_text().strip()
+            logger.info(
+                "ACP prompt end session=%s… wall_s=%.2f reply_chars=%s",
+                sid[:16] if sid else "",
+                dt,
+                len(text),
+            )
             if not text:
                 raise CodexAdapterError(
                     "ACP agent returned no streamed text for this turn. "

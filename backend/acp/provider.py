@@ -40,6 +40,11 @@ class AcpProvider:
         return self._mgr._agent_command  # noqa: SLF001
 
     @property
+    def acp_spawn_argv(self) -> tuple[str, ...]:
+        """Full ACP subprocess argv (codex-acp / npx …) for diagnostics."""
+        return self._mgr.spawn_argv
+
+    @property
     def timeout_seconds(self) -> int:
         return self._mgr._timeout  # noqa: SLF001
 
