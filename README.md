@@ -40,6 +40,62 @@ Frontend runs at `http://localhost:8501`.
 
 ---
 
+## Dev Branch Workflow
+
+- `main`: stable integration branch / default branch for ongoing mainline work
+- `master`: final presentation branch
+- `dev/win`: Windows-native development branch
+- `dev/wsl`: WSL/Linux development branch
+
+Recommended flow:
+- do day-to-day Windows work in `dev/win`
+- do WSL/Linux-side work in `dev/wsl`
+- merge validated work back into `main`
+- keep `master` for polished final presentation/demo state
+
+---
+
+## Windows / WSL Development Notes
+
+### On Windows (native)
+
+Recommended when you want:
+- PowerShell-first development
+- easiest local app startup via `scripts/start-dev.ps1`
+- testing Windows-specific CLI/runtime behavior
+
+Basic flow:
+
+```powershell
+git checkout dev/win
+uv sync
+./scripts/start-dev.ps1 -CodexMock "true"
+```
+
+### On WSL
+
+Recommended when you want:
+- Linux-like CLI behavior
+- easier shell scripting and backend iteration
+- parity with deployment/runtime environments
+
+Basic flow:
+
+```bash
+git checkout dev/wsl
+uv sync
+uv run uvicorn backend.main:app --reload
+uv run streamlit run app/streamlit_app.py
+```
+
+### Branch guidance
+
+- Prefer OS-specific environment/setup tweaks in `dev/win` or `dev/wsl`
+- Avoid putting temporary machine-specific paths or secrets into shared branches
+- After verification, merge clean cross-platform changes into `main`
+
+---
+
 ## User Flow
 
 ```
