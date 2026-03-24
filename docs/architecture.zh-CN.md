@@ -2,7 +2,7 @@
 
 > [English](architecture.md)
 
-本文说明系统如何分层、请求如何流转，以及后续迭代时该改哪里。如果你是第一次参与本仓库，建议从这里读起。
+本文说明系统分层、**对话（Chat）与任务（Task）** 如何协作、**大模型运行时**（Mock / ACP / Legacy Codex）如何选型，以及如何扩展功能。首次参与本仓库建议从这里读起。
 
 ---
 
@@ -12,278 +12,265 @@
 用户（浏览器）
     │
     ▼
-Streamlit 前端  (app/streamlit_app.py)
-    │  HTTP（requests）
+Streamlit  (app/streamlit_app.py)
+    │  HTTP（requests）— tasks、chat、可选 profile
     ▼
-FastAPI 后端  (backend/main.py)
-    ├── Schema profiler  →  从上传文件抽取列元数据
-    ├── Codex adapter    →  调用 Codex CLI（或 MockAdapter）生成计划
-    ├── Execution engine →  在 pandas DataFrame 上执行计划
-    └── Observability    →  将结构化日志与 JSON 快照写入 artifacts/
+FastAPI  (backend/main.py)
+    ├── 路由
+    │   ├── /tasks      — 结构化分析生命周期 + 改计划
+    │   ├── /chat       — 自由对话
+    │   ├── /data/profile — 仅生成 schema 画像（不建任务）
+    │   └── /skills     — 列出 SKILL.md 元数据
+    ├── Profiler        — 上传 → DataFrame + schema_profile
+    ├── Provider 层     — get_provider() → Mock | ACP | Legacy
+    ├── Execution       — AnalysisPlan → pandas → ResultPayload
+    └── Observability   — artifacts/events.log + 每任务 JSON 快照
 ```
 
-用户不会直接看到原始数据或代码；所有分析意图都通过 **AnalysisPlan** 这一份结构化 JSON 在中间传递，它描述「要算什么、怎么分组、怎么筛、怎么出图」。
+**AnalysisPlan** 仍是「规划 LLM」与「执行引擎」之间的契约。对话模式不强制产出计划；任务模式以计划为核心。
+
+**Provider 选择**（`backend/acp/factory.py`）逻辑概要：
+
+```mermaid
+flowchart TD
+    mockQ{CODEX_MOCK 为 true?}
+    acpQ{PATH 上存在 ACP 且未强制 legacy?}
+    mockQ -->|是| Mock[MockProvider]
+    mockQ -->|否| acpQ
+    acpQ -->|是| ACP[AcpProvider + AcpSessionManager]
+    acpQ -->|否| Leg[LegacyCodexProvider codex exec]
+```
+
+---
+
+## Streamlit：对话 vs 任务
+
+| 概念 | 行为 |
+|------|------|
+| **对话模式** | 默认。消息走 `POST /chat`，可带缓存的 `file_context`（schema profile）。 |
+| **任务模式** | 用户发送 `/task <问题>`。创建 `POST /tasks`，展示计划卡片；在计划待确认前，普通消息可走 `POST /tasks/{id}/revise`。 |
+| **Schema 缓存** | 文件变更时 `POST /data/profile` 刷新；聊天可不绑定 task_id 即带列信息。 |
+| **结果之后** | 「标记完成」回到对话；「未完成 — 重新规划」合并备注开新任务。 |
+
+侧边栏展示当前 **mode** 与 **active_task_id**，便于排查。
+
+---
+
+## 大模型与 Agent 运行时（`backend/acp/`）
+
+所有非 Mock 的 LLM 入口经 **`get_provider()`** 统一出口。对外是五个异步方法：`generate_plan`、`generate_summary`、`generate_followups`、`chat`、`revise_plan`。
+
+| 模块 | 职责 |
+|------|------|
+| `factory.py` | 选择 Provider；持有 `AcpSessionManager` 单例；应用 `lifespan` 结束时 `shutdown_providers()`。 |
+| `client.py` | `AnalysisAcpClient`（ACP 回调）+ `AcpSessionManager`（`initialize`、`session/new`、`session/prompt`、流式文本拼接）。对 **`acp` 包延迟导入**，避免未装 `agent-client-protocol` 时 Mock 模式无法启动。 |
+| `provider.py` | `AcpProvider`：用 `backend/codex/prompts.py` 组提示词，调 `prompt_for(逻辑键, 文本)`，再解析 JSON。 |
+| `legacy_codex.py` | `LegacyCodexProvider`：原「每次 `codex exec`」行为。 |
+| `mock.py` | `MockProvider`：确定性计划与固定对话。 |
+| `json_util.py` | 从模型输出中抠 JSON 对象/数组。 |
+| `errors.py` | `CodexAdapterError`。 |
+
+**兼容层：** `backend/codex/adapter.py`、`mock.py` 仅为旧引用重导出；新代码应使用 `get_provider()` 或 `backend.acp` 下类型。
+
+### ACP 会话
+
+- 每个 FastAPI 进程通常 **一个 agent 子进程**（单例）。
+- **逻辑键** 映射到 ACP `session_id`：如每个 `task_id` 用于计划/总结/追问/改计划；`/chat` 使用固定环境变量键 `ACP_CHAT_SESSION_KEY` 以保持多轮上下文。
+- **`session/new` 的 `cwd`：** 由 `ACP_SESSION_CWD` 或仓库根决定（`factory._acp_session_cwd`）。Codex 由此发现 `.agents/skills` 与 `AGENTS.md`。
+
+### 技能与提示词（`backend/skills/` + `.agents/skills/`）
+
+- **SkillRegistry** 扫描 `.agents/skills/*/SKILL.md`，解析 frontmatter，正文懒加载。
+- **`build_*_prompt(..., skill_instructions=...)`** 可在文首追加 `## Skill Context`。
+- **注入策略**（`acp_agent_uses_native_skills()`）：若 `ACP_AGENT_COMMAND` 含 `codex` 且未强制关闭，则假定 Codex **自行发现**技能，不在提示词里重复灌入。**Legacy** 子进程不会读仓库技能，故 **始终注入**。
 
 ---
 
 ## 请求生命周期
 
-### 第一步：创建任务（`POST /tasks`）
+### A — 结构化任务（`/tasks`）
 
-1. 前端把上传文件与自然语言问题发给后端。
-2. `schema_profiler.profile_upload()` 将文件解析为 `pd.DataFrame`，并抽取列名、dtype、空值数、样本值等。
-3. 这份 schema profile 交给 **Codex 适配层** 的 `generate_plan`，得到 `AnalysisPlan`。
-4. 任务写入内存（`backend/storage.py`），状态为 `planned`。
-5. 同一份 DataFrame 也以 `task_id` 为键保存在内存中，供后续执行使用。
+1. **`POST /tasks`** — 文件 + 问题 → 画像 → `generate_plan` → 内存中 `planned` + DataFrame。
+2. **审阅** — 展示/编辑计划 JSON。
+3. **`POST /tasks/{id}/revise`**（可选）— 自然语言改计划 → `revise_plan`。
+4. **`POST /tasks/{id}/review`** — 提交 `final_plan` → `run_plan` → `generate_summary` / `generate_followups` → `completed` 或 `failed`。
+5. **`GET /tasks/{id}/result`** — 取 `ResultPayload`。
 
-### 第二步：审阅计划（`GET /tasks/{id}`，对应 Plan / Review 页签）
+### B — 自由对话（`POST /chat`）
 
-1. 前端拉取任务，把计划以可编辑 JSON 形式展示。
-2. 用户可改任意字段：增删筛选、改聚合方式、调整图表类型等。
-3. 若 `confidence < 0.6` 或 `ambiguities` 非空，界面会给出提醒，提示仔细核对。
+JSON：`message`、`history[]`、可选 `file_context`、可选 `use_mock`。返回 `{ "reply": "..." }`。不写任务存储。
 
-### 第三步：提交审阅并执行（`POST /tasks/{id}/review`）
+### C — 仅画像（`POST /data/profile`）
 
-1. 前端提交（可能已编辑的）`final_plan`。
-2. 后端调用 `execution.engine.run_plan(df, final_plan)`：应用筛选、分组聚合，并组装图表与表格载荷。
-3. 再次调用适配层的 `generate_summary` 与 `generate_followups`。
-4. 任务状态依次经历：`reviewing` → `running` → `completed`（失败则为 `failed`）。
-
-### 第四步：获取结果（`GET /tasks/{id}/result`）
-
-返回 `ResultPayload`：图表数据、表格行、执行过程说明、模型生成的文字总结，以及若干后续分析问题。
+上传文件 → 与任务相同的 profiler → 只返回 **schema_profile**，不创建 `TaskRecord`。
 
 ---
 
 ## 核心数据结构
 
-所有契约类型都在 `backend/schemas/` 下，用 Pydantic 定义，可视为层与层之间的「唯一真相来源」。
+契约定义在 `backend/schemas/`（Pydantic）。
 
 ### `AnalysisPlan`（`schemas/plan.py`）
 
-系统的中心对象：由 Codex 适配层产出，由执行引擎消费。
-
-```
-AnalysisPlan
-├── goal: str                         # 用自然语言概括分析意图
-├── metrics: list[MetricSpec]         # 要算的指标（列 + 聚合方式 + 别名）
-├── dimensions: list[DimensionSpec]   # 分组维度（列 + 角色：时间/类别/地理）
-├── filters: list[FilterSpec]         # 行级筛选（列 + 操作符 + 取值）
-├── output: OutputSpec                # 图表类型（折线/柱状/直方）+ 是否展示表格
-├── ambiguities: list[AmbiguitySpec]  # 模型认为不确定的字段说明
-└── confidence: float | None          # 0.0–1.0，模型自评计划可靠度
-```
+由规划/改计划产出，由 `execution.engine.run_plan` 消费。
 
 ### `TaskRecord`（`schemas/task.py`）
 
-跟踪单次分析请求的完整生命周期。
-
-```
-TaskRecord
-├── task_id: str
-├── status: TaskStatus   # created → planned → reviewing → running → completed / failed
-├── input: TaskInput     # 问题原文、文件名、行列规模
-├── plan: AnalysisPlan   # 用户审阅前的 LLM 初版计划
-├── final_plan: AnalysisPlan | None   # 用户确认或修改后的计划
-├── result: ResultPayload | None
-└── error: TaskError | None
-```
+状态：`created` → `planned` → `reviewing` → `running` → `completed` | `failed`
 
 ### `ResultPayload`（`schemas/result.py`）
 
-```
-ResultPayload
-├── chart: ChartPayload       # 图表类型、x/y 列名、数据行
-├── table: TablePayload       # 列名列表 + 行数据（list[dict]）
-├── execution_summary: str    # 用自然语言描述 pandas 实际做了什么
-├── summary: str | None       # LLM 生成的结果解读
-└── follow_ups: list[str]     # 建议的 3 条后续分析问题
-```
+`chart`、`table`、`execution_summary`、`summary`、`follow_ups`
 
 ---
 
-## Codex 适配层（`backend/codex/`）
+## 提示词（`backend/codex/prompts.py`）
 
-这是代码里最重要的抽象：所有与大模型相关的交互都集中在这里，上层不必关心背后是真实 CLI 还是 Mock。
+| 函数 | 用途 |
+|------|------|
+| `build_plan_prompt` | 初次生成计划 JSON |
+| `build_revise_plan_prompt` | 按用户说明重写整份计划 |
+| `build_summary_prompt` | 执行后的中文解读 |
+| `build_followups_prompt` | 三条追问（JSON 数组） |
+| `build_chat_prompt` | 对话纯文本回复 |
 
-### `adapter.py` — `CodexAdapter`
-
-通过子进程调用 Codex CLI：
-
-```python
-await asyncio.create_subprocess_exec("codex", "exec", prompt, ...)
-```
-
-标准输出是纯文本。`_extract_json_payload()` 采用两种策略：
-1. 对整段输出直接 `json.loads()`。
-2. 取第一个 `{` 与最后一个 `}` 之间的子串再解析。
-
-若均失败，抛出 `CodexAdapterError`，路由层会回退到 `MockAdapter`。
-
-可通过环境变量配置：`CODEX_CLI_COMMAND`、`CODEX_TIMEOUT_SECONDS`、`CODEX_RETRY_COUNT`。
-
-### `mock.py` — `MockAdapter`
-
-不调用任何 CLI，按规则生成确定性计划，例如：
-- 选一个数值列作为指标；
-- 若有日期/时间列则作为时间维度；
-- 优先选 region、dept、product 等作为类别维度；
-- 识别「华东」「分布」等关键词以追加筛选或切换图表类型。
-
-**本地开发与 CI 建议始终使用 Mock**：设置 `CODEX_MOCK=true`（也是当前默认值）。
-
-### `prompts.py`
-
-三个提示词构建函数：
-- `build_plan_prompt` — 要求 Codex 只返回符合结构的 JSON `AnalysisPlan`。
-- `build_summary_prompt` — 要求返回 2–4 句中文短总结。
-- `build_followups_prompt` — 要求返回含 3 个追问的 JSON 数组。
-
-**若要提升计划质量，优先改这里的文案**；`build_plan_prompt` 里的输出结构说明必须与 `AnalysisPlan` 字段保持同步。
-
-### 自动降级
-
-当 Codex 连续失败达到 `CODEX_AUTO_MOCK_THRESHOLD` 次（默认 3），后端会在当前进程剩余生命周期内把 `CODEX_MOCK` 设为 `true`，避免 CLI 不可用时错误雪崩。
+**调优：** 同时维护 `prompts.py` 与 `.agents/skills` 下对应 `SKILL.md`，避免两套规则漂移。`build_plan_prompt` 中的 JSON 形状描述须与 `AnalysisPlan` 一致。
 
 ---
 
 ## 执行引擎（`backend/execution/engine.py`）
 
-`run_plan(df, plan) → ResultPayload`
-
-纯 pandas，不经过 LLM。分三步：
-
-1. **`_apply_filters`** — 遍历 `plan.filters`，用布尔索引筛选；若某列不存在则跳过该条（温和降级）。
-2. **`_aggregate`** — 若 `plan.metrics` 非空，则 `df.groupby(dimensions).agg(metrics)`；无维度时对整表聚合；结果最多保留 500 行。
-3. **`_build_chart`** — 选择 x/y 列并组装 `ChartPayload`；直方图场景用 `value_counts()`。
-
-**新增聚合方式**：在 `schemas/plan.py` 的 `Aggregation` 枚举中增加取值即可；引擎直接把 `metric.aggregation.value` 传给 pandas，如 `sum`、`mean` 等。
-
-**新增筛选操作符**：在 `FilterOperator` 中增加枚举，并在 `_apply_filters` 里补分支。
+`run_plan(df, plan) → ResultPayload`，纯 pandas。扩展方式：在 `schemas/plan.py` 增加枚举，在 `_apply_filters` / `_aggregate` / `_build_chart` 补分支。
 
 ---
 
 ## Schema 画像（`backend/profiler/schema_profiler.py`）
 
-`profile_upload(file: UploadFile) → (pd.DataFrame, dict)`
-
-支持 `.csv`、`.xlsx`、`.xls`；拒绝空文件。若行数超过 1 万，会随机抽样 1 万行（`random_state=42`，结果可复现）。
-
-返回的 `dict` 即传给 Codex 的 schema profile：含列名、dtype、空值数、每列最多 5 个样本值，便于模型把自然语言里的「销售额」「区域」等对到真实列名。
+`profile_upload` — 支持 CSV/XLSX/XLS；大文件抽样；返回 `(DataFrame, schema_profile)`，供任务、聊天上下文、`/data/profile` 使用。
 
 ---
 
-## 可观测性（`backend/observability.py`）
+## 可观测性与存储
 
-每个任务会在 `artifacts/`（自动创建）下产生两类产物：
-
-| 产物 | 路径 | 内容 |
-|------|------|------|
-| 事件日志 | `artifacts/events.log` | 每行一条 JSON：`ts`、`task_id`、`stage`、`event_type`、`payload` |
-| 快照 | `artifacts/tasks/<task_id>/<name>.json` | input、schema_profile、plan、final_plan、result、错误、diff 等的完整 JSON |
-
-**排查失败任务**：在界面记下 `task_id`，打开 `artifacts/tasks/<task_id>/`；`review_diff.json` 可对照用户在 Review 页改了哪些字段。
+MVP 仍为内存任务表 + `artifacts/` 快照；重启丢失任务。详见 `observability.py`、`storage.py`。
 
 ---
 
-## 存储（`backend/storage.py`）
-
-三个模块级内存字典：
-
-| 字典 | 键 | 值 |
-|------|----|----|
-| `TASKS` | `task_id` | `TaskRecord` |
-| `TASK_DATAFRAMES` | `task_id` | `pd.DataFrame` |
-| `TASK_SNAPSHOTS` | `task_id` | 原始 schema profile 等 |
-
-**服务重启后数据全部丢失**——这是 MVP 有意为之。若要持久化，可把这些字典换成数据库（SQLite 通常是第一步），详见下文「刻意未实现的能力」。
-
----
-
-## API 一览
-
-所有路由挂在 `/tasks`（`backend/routers/tasks.py`）。
+## HTTP API 一览
 
 | 方法 | 路径 | 作用 |
 |------|------|------|
-| `POST` | `/tasks` | 创建任务：上传文件 + 问题 → 返回计划 |
-| `GET` | `/tasks/{id}` | 获取完整 `TaskRecord` |
-| `POST` | `/tasks/{id}/review` | 提交最终计划 → 执行 → 返回更新后的记录 |
-| `GET` | `/tasks/{id}/result` | 获取 `ResultPayload`（未就绪时返回状态说明） |
-| `POST` | `/tasks/{id}/fail` | 开发用：手动标记任务失败 |
-| `POST` | `/tasks/{id}/reset` | 恢复：将卡住的任务重置为 `planned` |
+| `GET` | `/` | 服务标识 |
+| `GET` | `/health` | 健康检查 |
+| `GET` | `/skills` | 技能元数据列表 |
+| `POST` | `/chat` | 自由对话 |
+| `POST` | `/data/profile` | 仅上传画像 |
+| `POST` | `/tasks` | 创建任务 → 计划 |
+| `GET` | `/tasks/{id}` | 完整 `TaskRecord` |
+| `POST` | `/tasks/{id}/revise` | 改计划（待确认阶段） |
+| `POST` | `/tasks/{id}/review` | 提交 `final_plan` 并执行 |
+| `GET` | `/tasks/{id}/result` | 结果或状态 |
+| `POST` | `/tasks/{id}/fail` | 开发用：标记失败 |
+| `POST` | `/tasks/{id}/reset` | 重置为 `planned` |
 
-交互式文档：`http://127.0.0.1:8000/docs`
+交互文档：`http://127.0.0.1:8000/docs`
 
 ---
 
-## 扩展功能时的检查清单
+## 分步验证（开发者自测）
 
-### 新增筛选操作符
+### 环境
 
-1. 在 `backend/schemas/plan.py` 的 `FilterOperator` 中增加枚举值。
-2. 在 `backend/execution/engine.py` 的 `_apply_filters` 中增加分支。
-3. 在 `backend/codex/prompts.py` 的 `build_plan_prompt` 里更新输出结构说明。
-4. 在 `tests/fixtures/cases.json` 增加用例，并配上对应 CSV。
+Python **3.12+**，**`uv`**。`CODEX_MOCK=true` 时可不装 Codex CLI。
 
-### 新增图表类型
+```bash
+uv sync
+uv run python -c "import fastapi, streamlit; print('OK')"
+```
 
-1. 在 `backend/schemas/plan.py` 的 `ChartType` 中增加枚举。
-2. 在 `app/streamlit_app.py` 的 `_draw_chart` 中增加渲染分支。
-3. 在 `backend/execution/engine.py` 的 `_build_chart` 中补充数据构造逻辑。
+### 第 0 层 — 回归（无需起服务）
 
-### 新增 LLM 能力（例如异常检测）
+```bash
+uv run python tests/run_regression.py --mode mock
+```
 
-1. 在 `backend/codex/prompts.py` 增加提示词构建函数。
-2. 在 `CodexAdapter` 与 `MockAdapter` 中各增加对应方法（两边行为要对齐）。
-3. 在合适的 router 中调用。
-4. 若结果需要持久化，在相关 schema 中增加字段。
+### 第 1 层 — 后端
+
+```bash
+uv run uvicorn backend.main:app --reload
+```
+
+- `curl http://127.0.0.1:8000/health`
+- `curl http://127.0.0.1:8000/skills`
+- `POST /tasks` 创建任务（与旧文档相同）
+- 可选：`POST /chat`，body 为 `{"message":"你好","history":[]}`
+
+### 第 2 层 — Streamlit
+
+```bash
+uv run streamlit run app/streamlit_app.py
+```
+
+上传夹具 CSV → 先发聊天 → 再 `/task …` → 审阅 → 结果。
+
+### 常见问题
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| `No module named 'acp'` | 未装 `agent-client-protocol` | `uv sync` |
+| 关 Mock 后 `ImportError: ACP mode requires...` | 缺 SDK | 安装包或改回 Mock |
+| `No module named 'backend'` | 工作目录错误 | 在仓库根执行命令 |
+| 8000 端口占用 | 旧进程未杀 | 结束进程或换端口 |
+| Streamlit 连接被拒绝 | 后端未起 | 先起 API |
+| 图表为空 | 筛选过严 | 放宽计划中的 filters |
+| Codex 不加载技能 | ACP cwd 不对 | `ACP_SESSION_CWD` 设为仓库根绝对路径 |
+
+---
+
+## 扩展功能检查清单
+
+### 新筛选 / 图表 / 聚合
+
+1. `schemas/plan.py` 枚举  
+2. `execution/engine.py` 实现  
+3. `build_plan_prompt` + 必要时更新 `analysis-planner/SKILL.md`  
+4. `tests/fixtures` 回归用例  
+
+### 新 LLM 能力
+
+1. `prompts.py` 增加 `build_*`（可带 `skill_instructions`）  
+2. **MockProvider / AcpProvider / LegacyCodexProvider** 三处方法对齐  
+3. Router +（如需）Streamlit  
 
 ### 提升计划质量
 
-编辑 `backend/codex/prompts.py` 中的 `build_plan_prompt`。常见有效手段：
-- 补充示例列名，帮助模型对齐 schema；
-- 加入少量高质量计划的 few-shot；
-- 收紧 JSON 结构描述，减少虚构字段名。
+改提示词与 Skill 正文；加 few-shot；收紧 JSON 说明。  
 
 ---
 
 ## 运行测试
 
 ```bash
-# 回归（Mock 模式，无需 Codex CLI）
 uv run python tests/run_regression.py --mode mock
-
-# 回归（真实模式，需要 Codex CLI）
 uv run python tests/run_regression.py --mode real
 ```
 
-夹具在 `tests/fixtures/`。`cases.json` 里每条包含：
-- `name` — 用例标识
-- `file` — 相对 `fixtures/` 的 CSV 文件名
-- `question` — 自然语言问题
-- `expected_chart_type` — `"line"`、`"bar"` 或 `"histogram"`
-- `expected_metric_column` — 期望的指标列名（仅供参考）
-
-新增用例：把 CSV 放进 `tests/fixtures/`，再在 `cases.json` 里追加一条即可。
-
 ---
 
-## 刻意未实现的能力（MVP 边界）
-
-下列项是已知取舍，不是遗漏的 bug；为控制 MVP 范围而暂缓。
+## MVP 边界（更新）
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
-| 持久化存储 | 未实现 | 仅内存；重启任务清空 |
-| 身份认证 | 未实现 | 无账号、无 API Key |
-| 多轮对话 / 记忆 | 未实现 | 每个任务相互独立 |
-| Skill 库 | 未实现 | 无可复用的分析模板体系 |
-| ACP 等 Agent 协议 | 未实现 | 直接调 Codex CLI |
-| 流式响应 | 未实现 | 结果同步返回 |
-| Excel 导出 | 未实现 | 表格仅支持 CSV 下载 |
-| 多表关联 | 未实现 | 单次任务单文件 |
-| 列级权限 | 未实现 | LLM 可见全部列元数据 |
+| 持久化存储 | 未实现 | 仅内存任务 |
+| 身份认证 | 未实现 | — |
+| 长期用户记忆 | 未实现 | ACP 会话为进程级上下文 |
+| **技能库（仓库内）** | **部分** | `.agents/skills` + Registry + 注入；无 UI 编辑、无 artifact→skill 闭环 |
+| **ACP 集成** | **已实现** | 可选；需 agent 与 SDK |
+| **对话 + 任务双模式** | **已实现** | Streamlit + `/chat` + `/tasks` + revise |
+| 流式推到浏览器 | 未实现 | 服务端聚合 ACP 流 |
+| Excel 导出 | 未实现 | 表格仅 CSV |
+| 多表关联 | 未实现 | 单文件单任务 |
+| 列级权限 | 未实现 | — |
 
 ---
 
@@ -291,12 +278,18 @@ uv run python tests/run_regression.py --mode real
 
 | 包 | 用途 |
 |----|------|
-| `fastapi` + `uvicorn` | 后端 API 服务 |
-| `streamlit` | 前端界面 |
-| `pandas` + `numpy` | 执行引擎中的数据处理 |
-| `pydantic` | 各层数据契约校验 |
-| `python-multipart` | FastAPI 文件上传所需 |
-| `requests` | Streamlit 调用后端 |
-| `uv` | 包管理与虚拟环境 |
+| `fastapi`、`uvicorn` | API |
+| `streamlit` | 前端 |
+| `pandas`、`numpy` | 执行 |
+| `pydantic` | 契约 |
+| `python-multipart` | 上传 |
+| `requests` | 前端调 API |
+| **`agent-client-protocol`** | ACP（`import acp`），在 `client.py` 中延迟加载 |
 
-Codex CLI **不是** Python 包，需单独安装并能在 `PATH` 中找到（或通过 `CODEX_CLI_COMMAND` 指定）。当 `CODEX_MOCK=true` 时不会调用 CLI。
+**Codex CLI** / **`codex-acp`** 非 Python 包，需单独安装并配置 `PATH`（或通过环境变量指定）。`CODEX_MOCK=true` 时不调用。
+
+---
+
+## 关于旧版「CodexAdapter」叙述
+
+历史上的一次性子进程实现现位于 **`LegacyCodexProvider`**（`backend/acp/legacy_codex.py`）。`backend/codex/adapter.py` 仅为兼容重导出。新代码请使用 **`get_provider()`** 或 `backend.acp` 包内类型。

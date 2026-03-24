@@ -2,9 +2,9 @@
 
 > [简体中文](README.zh-CN.md)
 
-A natural-language-driven data analytics workbench.
+A natural-language-driven data analytics workbench. Upload a CSV or Excel file, talk to an assistant in **chat** or **task** mode, review structured analysis plans when you need them, and get charts, tables, and summaries — without writing SQL or code.
 
-Upload a CSV/Excel file, describe what you want to analyze in plain language, review the generated analysis plan, and get back a chart, table, and summary — all without writing SQL or code.
+The backend can drive LLMs through **mock** (offline), **ACP** (long-lived Agent Client Protocol sessions, e.g. Codex via `codex-acp`), or **legacy** one-shot `codex exec`, selected automatically from environment and installed tools.
 
 ---
 
@@ -16,13 +16,15 @@ Upload a CSV/Excel file, describe what you want to analyze in plain language, re
 uv sync
 ```
 
+This installs Python dependencies including **`agent-client-protocol`** (import name `acp`). The ACP SDK is loaded **lazily** when you first use ACP mode, so mock-only development still starts cleanly after `uv sync`.
+
 ### 2. Start the backend (terminal 1)
 
 ```bash
 uv run uvicorn backend.main:app --reload
 ```
 
-Backend runs at `http://127.0.0.1:8000`. Interactive API docs at `http://127.0.0.1:8000/docs`.
+Backend: `http://127.0.0.1:8000` · Swagger: `http://127.0.0.1:8000/docs`
 
 ### 3. Start the frontend (terminal 2)
 
@@ -30,9 +32,9 @@ Backend runs at `http://127.0.0.1:8000`. Interactive API docs at `http://127.0.0
 uv run streamlit run app/streamlit_app.py
 ```
 
-Frontend runs at `http://localhost:8501`.
+Frontend: `http://localhost:8501`
 
-### 4. One-click startup (PowerShell, opens two terminals)
+### 4. One-click startup (PowerShell)
 
 ```powershell
 ./scripts/start-dev.ps1 -CodexMock "true"
@@ -40,70 +42,41 @@ Frontend runs at `http://localhost:8501`.
 
 ---
 
-## Dev Branch Workflow
+## User Flow (Streamlit)
 
-- `main`: stable integration branch / default branch for ongoing mainline work
-- `master`: final presentation branch
-- `dev/win`: Windows-native development branch
-- `dev/wsl`: WSL/Linux development branch
+### Chat vs task mode
 
-Recommended flow:
-- do day-to-day Windows work in `dev/win`
-- do WSL/Linux-side work in `dev/wsl`
-- merge validated work back into `main`
-- keep `master` for polished final presentation/demo state
+| Mode | How to enter | What happens |
+|------|----------------|---------------|
+| **Chat** | Default after load | Free-form Q&A about the file schema and analysis ideas. Plain text replies. |
+| **Task** | Type **`/task`** followed by your question | Creates a structured pipeline: **plan → review → execute → results**. |
+| **Plan revision** | While in task mode with a **pending** plan, send a normal message | Backend calls `POST /tasks/{id}/revise` to rewrite the plan from your feedback. |
+| **After results** | Completion card | **Mark complete** returns to chat mode; **Not done — replan** starts a new task with your note. |
+
+Typical session:
+
+```
+Sidebar     →  upload CSV/Excel (schema is cached for chat context)
+Chat        →  ask questions freely, or `/task …` for a full analysis run
+Plan        →  review metrics, filters, chart type; edit JSON if needed; confirm
+Results     →  chart + table + summary + follow-up chips (can spawn another `/task`)
+```
 
 ---
 
-## Windows / WSL Development Notes
+## Agent backends (how the LLM is called)
 
-### On Windows (native)
+`backend.acp.factory.get_provider()` picks one implementation per request:
 
-Recommended when you want:
-- PowerShell-first development
-- easiest local app startup via `scripts/start-dev.ps1`
-- testing Windows-specific CLI/runtime behavior
+| Provider | When | Notes |
+|----------|------|--------|
+| **MockProvider** | `CODEX_MOCK=true` (default) | No CLI; deterministic plans and canned chat. |
+| **AcpProvider** | `CODEX_MOCK=false`, ACP agent on `PATH`, `ACP_BACKEND` not forced to legacy | Long-lived stdio JSON-RPC to `ACP_AGENT_COMMAND` (default `codex-acp`). One subprocess per API process; logical sessions per `task_id` and a shared chat key. |
+| **LegacyCodexProvider** | `CODEX_MOCK=false` but no ACP binary or `ACP_BACKEND=legacy` | One-shot `codex exec` per call (previous behavior). |
 
-Basic flow:
+Skills under `.agents/skills/` are discovered by Codex when **ACP session `cwd`** points at the repo (see `ACP_SESSION_CWD`). Non-Codex agents get skill bodies **injected** into prompts unless `ACP_AGENT_NATIVE_SKILLS` disables injection.
 
-```powershell
-git checkout dev/win
-uv sync
-./scripts/start-dev.ps1 -CodexMock "true"
-```
-
-### On WSL
-
-Recommended when you want:
-- Linux-like CLI behavior
-- easier shell scripting and backend iteration
-- parity with deployment/runtime environments
-
-Basic flow:
-
-```bash
-git checkout dev/wsl
-uv sync
-uv run uvicorn backend.main:app --reload
-uv run streamlit run app/streamlit_app.py
-```
-
-### Branch guidance
-
-- Prefer OS-specific environment/setup tweaks in `dev/win` or `dev/wsl`
-- Avoid putting temporary machine-specific paths or secrets into shared branches
-- After verification, merge clean cross-platform changes into `main`
-
----
-
-## User Flow
-
-```
-Ask tab        →  upload file + type question
-Plan tab       →  review the generated AnalysisPlan
-Review tab     →  edit filters / metrics / dimensions, then submit
-Results tab    →  chart + table + summary + follow-up suggestions
-```
+Full detail: [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -111,26 +84,73 @@ Results tab    →  chart + table + summary + follow-up suggestions
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CODEX_MOCK` | `true` | `true` = use MockAdapter (no Codex CLI needed); `false` = call real Codex CLI |
-| `CODEX_CLI_COMMAND` | `codex` | Path or name of the Codex CLI binary |
-| `CODEX_TIMEOUT_SECONDS` | `60` | Max seconds to wait for a Codex CLI response |
-| `CODEX_RETRY_COUNT` | `1` | Number of retries on Codex parse failure |
-| `CODEX_AUTO_MOCK_THRESHOLD` | `3` | Auto-degrade to mock after N consecutive Codex failures |
-| `API_BASE_URL` | `http://127.0.0.1:8000` | Backend URL used by the Streamlit frontend |
+| `CODEX_MOCK` | `true` | `true` = MockProvider; `false` = real LLM path (ACP if available, else legacy `codex exec`). |
+| `CODEX_CLI_COMMAND` | `codex` | Legacy provider only: Codex CLI binary. |
+| `CODEX_TIMEOUT_SECONDS` | `60` | Legacy default; ACP manager may use the same env where applicable. |
+| `CODEX_RETRY_COUNT` | `1` | Retries on plan / revise parse failures. |
+| `CODEX_AUTO_MOCK_THRESHOLD` | `3` | Consecutive failures → auto mock for process lifetime. |
+| `CODEX_HTTP_TRANSPORT_ONLY` | `true` | Legacy Codex: prefer HTTP/SSE provider vs WebSocket (see architecture doc). |
+| `CODEX_SSE_PROVIDER_ID` | `openai_sse` | Synthetic provider id for `-c` overrides. |
+| `CODEX_EXTRA_CONFIG` | *(empty)* | Extra `codex -c` pairs, semicolon-separated. |
+| `ACP_AGENT_COMMAND` | `codex-acp` | ACP agent executable when on `PATH`. |
+| `ACP_AGENT_ARGS` | *(empty)* | Extra args (shell-tokenized). |
+| `ACP_BACKEND` | *(auto)* | `legacy` / `exec` / `codex-exec` forces legacy despite ACP binary. |
+| `ACP_CHAT_SESSION_KEY` | `xyf-global-chat` | Logical session key for `POST /chat` continuity. |
+| `ACP_SESSION_CWD` | *(repo root)* | `session/new` working directory so Codex loads `.agents/skills` and `AGENTS.md`. |
+| `ACP_AGENT_NATIVE_SKILLS` | *(auto)* | `true`/`false` overrides prompt injection; unset → skip injection if command contains `codex`. |
+| `API_BASE_URL` | `http://127.0.0.1:8000` | Streamlit → backend base URL. |
+
+---
+
+## Skills (`.agents/skills`)
+
+Repository skills use the **Codex / agentskills** layout: each folder contains `SKILL.md` with YAML frontmatter (`name`, `description`) plus instructions.
+
+- Shipped examples: `analysis-planner`, `data-chat`, `plan-reviser` (aligned with prompt builders).
+- **List metadata:** `GET http://127.0.0.1:8000/skills`
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|----------------|-----|
+| `ModuleNotFoundError: No module named 'acp'` | Dependencies not installed | Run `uv sync` from repo root; use `uv run …` so the project venv is active. |
+| `ImportError: ACP mode requires 'agent-client-protocol'` | Mock off but SDK missing | `uv sync` or `pip install 'agent-client-protocol>=0.8.1'`. |
+| Backend starts but ACP calls fail | Agent binary missing | Install `codex-acp` (or your agent) on `PATH`, or set `ACP_BACKEND=legacy`. |
+| Codex ignores skills | Wrong `cwd` | Set `ACP_SESSION_CWD` to the repo root (absolute path). |
+
+---
+
+## Dev Branch Workflow
+
+- `main` — integration default
+- `master` — presentation polish
+- `dev/win` — Windows-native
+- `dev/wsl` — WSL/Linux
+
+Merge validated work into `main`; keep `master` for demos.
+
+---
+
+## Windows / WSL
+
+**Windows (native):** `git checkout dev/win` → `uv sync` → `./scripts/start-dev.ps1 -CodexMock "true"`
+
+**WSL:** `git checkout dev/wsl` → `uv sync` → `uv run uvicorn …` and `uv run streamlit …`
+
+Avoid committing machine-specific paths or secrets.
 
 ---
 
 ## Running the Regression Suite
 
 ```bash
-# Mock mode (no Codex CLI required)
 uv run python tests/run_regression.py --mode mock
-
-# Real mode (requires Codex CLI installed and configured)
-uv run python tests/run_regression.py --mode real
+uv run python tests/run_regression.py --mode real   # needs Codex CLI + config
 ```
 
-Output is a JSON report with `passed`, `total`, `success_rate`, and per-case results.
+Output: JSON with `passed`, `total`, `success_rate`, per-case results.
 
 ---
 
@@ -138,42 +158,35 @@ Output is a JSON report with `passed`, `total`, `success_rate`, and per-case res
 
 ```
 xyf-competition-mvp/
+├── .agents/
+│   └── skills/                 # SKILL.md packs (Codex discovery + SkillRegistry)
 ├── app/
-│   └── streamlit_app.py        # Streamlit UI (4 tabs: Ask/Plan/Review/Results)
+│   └── streamlit_app.py        # Chat/task UI, upload, plan review, results
 ├── backend/
-│   ├── main.py                 # FastAPI app entry point
-│   ├── storage.py              # In-memory task store (resets on restart)
-│   ├── observability.py        # Structured logging + snapshot utilities
+│   ├── main.py                 # FastAPI + lifespan → shutdown_providers()
+│   ├── storage.py
+│   ├── observability.py
+│   ├── acp/                    # ACP client, providers, factory, legacy exec shim
+│   ├── skills/                 # SkillRegistry, native-skill detection, prompt injection
 │   ├── routers/
-│   │   └── tasks.py            # All /tasks endpoints
+│   │   ├── tasks.py            # /tasks/*
+│   │   ├── chat.py             # POST /chat
+│   │   ├── data.py             # POST /data/profile
+│   │   └── skills.py           # GET /skills
 │   ├── schemas/
-│   │   ├── plan.py             # AnalysisPlan and related types
-│   │   ├── task.py             # TaskRecord, TaskStatus
-│   │   └── result.py           # ResultPayload, ChartPayload, TablePayload
 │   ├── codex/
-│   │   ├── adapter.py          # CodexAdapter: subprocess + JSON parsing
-│   │   ├── mock.py             # MockAdapter: deterministic plans, no CLI needed
-│   │   └── prompts.py          # Prompt templates for plan/summary/followups
+│   │   ├── prompts.py          # Plan / summary / followups / chat / revise prompts
+│   │   ├── adapter.py          # Shim → LegacyCodexProvider
+│   │   └── mock.py             # Shim → MockProvider
 │   ├── execution/
-│   │   └── engine.py           # AnalysisPlan → pandas ops → ResultPayload
 │   └── profiler/
-│       └── schema_profiler.py  # File upload → column metadata dict
 ├── tests/
-│   ├── fixtures/
-│   │   ├── cases.json          # Regression test case definitions
-│   │   ├── sales_data.csv
-│   │   ├── employee_survey.csv
-│   │   └── web_traffic.csv
-│   └── run_regression.py       # Regression runner (mock + real modes)
-├── artifacts/                  # Auto-created; task snapshots + event log
-│   ├── events.log
-│   └── tasks/<task_id>/        # Per-task JSON snapshots
+├── artifacts/                  # Runtime logs + per-task JSON snapshots
 ├── scripts/
-│   └── start-dev.ps1           # One-click dev startup (PowerShell)
 ├── docs/
-│   ├── product-thoughts.md     # Product design notes
-│   ├── architecture.md         # Developer guide (English)
-│   └── architecture.zh-CN.md   # Developer guide (简体中文)
+│   ├── architecture.md
+│   ├── architecture.zh-CN.md
+│   └── product-thoughts.md
 └── pyproject.toml
 ```
 
@@ -183,8 +196,9 @@ xyf-competition-mvp/
 
 See [`docs/architecture.md`](docs/architecture.md) for:
 
-- How each layer works and where to find it
-- How to add a new analysis capability
-- How to improve Codex prompt quality
-- How to add new test fixtures
-- What is deliberately not implemented yet (and why)
+- End-to-end layer walkthrough (regression → API → Streamlit)
+- **ACP vs legacy vs mock** wiring
+- **Chat, revise, and profiling** request paths
+- Skills and prompt injection rules
+- How to extend filters, charts, and LLM surfaces
+- MVP boundaries and dependency table

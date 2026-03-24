@@ -12,7 +12,13 @@ Write-Host "CODEX_MOCK=$CodexMock"
 $env:CODEX_MOCK = $CodexMock
 $env:API_BASE_URL = $ApiBaseUrl
 
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "uv run uvicorn backend.main:app --reload"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "uv run streamlit run app/streamlit_app.py"
+$projectRoot = (Get-Location).Path
+
+Start-Process powershell -ArgumentList "-NoExit", "-Command", @"
+Set-Location '$projectRoot'; `$env:CODEX_MOCK='$CodexMock'; `$env:API_BASE_URL='$ApiBaseUrl'; uv run uvicorn backend.main:app --reload
+"@
+Start-Process powershell -ArgumentList "-NoExit", "-Command", @"
+Set-Location '$projectRoot'; `$env:CODEX_MOCK='$CodexMock'; `$env:API_BASE_URL='$ApiBaseUrl'; uv run streamlit run app/streamlit_app.py
+"@
 
 Write-Host "Backend and Streamlit launched in separate terminals."

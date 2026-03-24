@@ -6,11 +6,12 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
-from backend.codex.adapter import CodexAdapterError, get_adapter
-from backend.codex.mock import MockAdapter
+from backend.acp.errors import CodexAdapterError
+from backend.acp.factory import get_provider
+from backend.acp.mock import MockProvider
 from backend.execution.engine import run_plan
 from backend.observability import diff_dicts, log_event, save_snapshot
 from backend.profiler.schema_profiler import profile_upload
@@ -21,8 +22,26 @@ from backend.storage import CODEX_FAILURE_COUNT, TASK_DATAFRAMES, TASK_SNAPSHOTS
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
+def _effective_use_mock(explicit: bool | None) -> bool:
+    """Per-request override; if omitted, follow process env CODEX_MOCK (default true)."""
+    if explicit is not None:
+        return explicit
+    return os.getenv("CODEX_MOCK", "true").lower() == "true"
+
+
 class ReviewRequest(BaseModel):
     final_plan: AnalysisPlan
+    use_mock: bool | None = None
+
+
+class ReviseRequest(BaseModel):
+    instruction: str
+    use_mock: bool | None = None
+
+
+class RevisePlanResponse(BaseModel):
+    task_id: str
+    plan: AnalysisPlan
 
 
 class CreateTaskResponse(BaseModel):
@@ -59,22 +78,34 @@ def _reset_codex_failure_counter() -> None:
 
 @router.post("", response_model=CreateTaskResponse)
 async def create_task(
-    question: str = Form(...), file: UploadFile = File(...)
+    question: str = Form(...),
+    file: UploadFile = File(...),
+    use_mock: bool | None = Query(
+        default=None,
+        description="If set, overrides CODEX_MOCK for this request. Prefer query string "
+        "so clients using multipart file upload do not lose this flag.",
+    ),
 ) -> CreateTaskResponse:
     task_id = str(uuid.uuid4())
     df, schema_profile = profile_upload(file)
-    use_mock = os.getenv("CODEX_MOCK", "true").lower() == "true"
-    adapter = MockAdapter() if use_mock else get_adapter()
+    explicit = use_mock
+    use_mock_flag = _effective_use_mock(explicit)
+    adapter = get_provider(use_mock_flag)
     try:
         plan = await adapter.generate_plan(
             question=question, schema_profile=schema_profile, task_id=task_id
         )
-        log_event(task_id, "plan", "plan_generated", {"use_mock": use_mock})
+        log_event(task_id, "plan", "plan_generated", {"use_mock": use_mock_flag})
     except (CodexAdapterError, Exception) as exc:
         _record_codex_failure(task_id, str(exc))
-        if not use_mock:
-            # Fallback to mock when Codex runtime is unavailable.
-            plan = await MockAdapter().generate_plan(
+        if not use_mock_flag:
+            if explicit is False:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Codex plan generation failed (mock fallback disabled for this request): {exc}",
+                ) from exc
+            # Env-driven real Codex: allow silent mock fallback when CLI is unavailable.
+            plan = await MockProvider().generate_plan(
                 question=question, schema_profile=schema_profile, task_id=task_id
             )
             schema_profile["codex_fallback_reason"] = str(exc)
@@ -87,7 +118,7 @@ async def create_task(
         else:
             raise
     else:
-        if not use_mock:
+        if not use_mock_flag:
             _reset_codex_failure_counter()
 
     record = TaskRecord(
@@ -112,6 +143,82 @@ async def create_task(
     return CreateTaskResponse(task_id=task_id, status=record.status, plan=plan)
 
 
+@router.post("/{task_id}/revise", response_model=RevisePlanResponse)
+async def revise_plan(
+    task_id: str,
+    payload: ReviseRequest,
+    use_mock: bool | None = Query(
+        default=None,
+        description="If set, overrides JSON body use_mock for this request.",
+    ),
+) -> RevisePlanResponse:
+    """Regenerate the analysis plan from user feedback before execution."""
+    record = TASKS.get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if record.plan is None:
+        raise HTTPException(status_code=400, detail="Task has no plan to revise")
+    if record.status != TaskStatus.PLANNED:
+        raise HTTPException(
+            status_code=400,
+            detail="Plan can only be revised while the task is in planned state",
+        )
+
+    instruction = payload.instruction.strip()
+    if not instruction:
+        raise HTTPException(status_code=400, detail="instruction must not be empty")
+
+    snapshots = TASK_SNAPSHOTS.get(task_id) or {}
+    schema_profile = snapshots.get("schema_profile")
+    if not schema_profile:
+        raise HTTPException(
+            status_code=500,
+            detail="Schema profile missing for task; cannot revise plan",
+        )
+
+    explicit = use_mock if use_mock is not None else payload.use_mock
+    use_mock_flag = _effective_use_mock(explicit)
+    adapter = get_provider(use_mock_flag)
+
+    try:
+        new_plan = await adapter.revise_plan(
+            current_plan=record.plan,
+            instruction=instruction,
+            schema_profile=schema_profile,
+            task_id=task_id,
+        )
+        log_event(task_id, "plan", "plan_revised", {"use_mock": use_mock_flag})
+    except (CodexAdapterError, Exception) as exc:
+        _record_codex_failure(task_id, str(exc))
+        if not use_mock_flag:
+            if explicit is False:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Codex plan revision failed (mock fallback disabled): {exc}",
+                ) from exc
+            new_plan = await MockProvider().revise_plan(
+                current_plan=record.plan,
+                instruction=instruction,
+                schema_profile=schema_profile,
+                task_id=task_id,
+            )
+            log_event(
+                task_id,
+                "plan",
+                "codex_revise_fallback",
+                {"error_type": "codex_error", "error": str(exc)},
+            )
+    else:
+        if not use_mock_flag:
+            _reset_codex_failure_counter()
+
+    record.plan = new_plan
+    save_snapshot(task_id, "plan", new_plan.model_dump())
+    log_event(task_id, "revise", "plan_updated", {"status": record.status.value})
+
+    return RevisePlanResponse(task_id=task_id, plan=new_plan)
+
+
 @router.get("/{task_id}", response_model=TaskRecord)
 async def get_task(task_id: str) -> TaskRecord:
     record = TASKS.get(task_id)
@@ -121,7 +228,14 @@ async def get_task(task_id: str) -> TaskRecord:
 
 
 @router.post("/{task_id}/review", response_model=TaskRecord)
-async def submit_review(task_id: str, payload: ReviewRequest) -> TaskRecord:
+async def submit_review(
+    task_id: str,
+    payload: ReviewRequest,
+    use_mock: bool | None = Query(
+        default=None,
+        description="If set, overrides JSON body use_mock for this request.",
+    ),
+) -> TaskRecord:
     record = TASKS.get(task_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -147,8 +261,9 @@ async def submit_review(task_id: str, payload: ReviewRequest) -> TaskRecord:
             "columns": record.result.table.columns,
             "chart_type": record.result.chart.chart_type.value,
         }
-        use_mock = os.getenv("CODEX_MOCK", "true").lower() == "true"
-        adapter = MockAdapter() if use_mock else get_adapter()
+        explicit = use_mock if use_mock is not None else payload.use_mock
+        use_mock_flag = _effective_use_mock(explicit)
+        adapter = get_provider(use_mock_flag)
         try:
             summary_text = await adapter.generate_summary(
                 goal=payload.final_plan.goal,

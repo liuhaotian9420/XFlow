@@ -2,7 +2,7 @@
 
 > [简体中文](architecture.zh-CN.md)
 
-This document explains how the system is structured, how the layers connect, and how to extend it. Start here if you are contributing to this repo for the first time.
+This document explains how the system is structured, how **chat vs task** flows work, how the **LLM runtime** (mock / ACP / legacy Codex) is selected, and how to extend the codebase. Start here if you are contributing for the first time.
 
 ---
 
@@ -12,278 +12,281 @@ This document explains how the system is structured, how the layers connect, and
 User (browser)
     │
     ▼
-Streamlit frontend  (app/streamlit_app.py)
-    │  HTTP (requests)
+Streamlit  (app/streamlit_app.py)
+    │  HTTP (requests) — tasks, chat, optional profile
     ▼
-FastAPI backend  (backend/main.py)
-    ├── Schema profiler  →  extracts column metadata from uploaded file
-    ├── Codex adapter    →  calls Codex CLI (or MockAdapter) to produce a plan
-    ├── Execution engine →  runs the plan against a pandas DataFrame
-    └── Observability    →  writes structured logs and JSON snapshots to artifacts/
+FastAPI  (backend/main.py)
+    ├── Routers
+    │   ├── /tasks      — structured analysis lifecycle + plan revision
+    │   ├── /chat       — free-form assistant turns
+    │   ├── /data/profile — schema profile without creating a task (chat context)
+    │   └── /skills     — list SKILL.md metadata
+    ├── Profiler        — upload → DataFrame + schema_profile dict
+    ├── Provider layer  — get_provider() → Mock | ACP | Legacy Codex
+    ├── Execution engine — AnalysisPlan → pandas → ResultPayload
+    └── Observability   — artifacts/events.log + per-task JSON snapshots
 ```
 
-The user never sees raw data or code. Everything is mediated through an **AnalysisPlan** — a structured JSON object that describes what to compute.
+The **AnalysisPlan** JSON remains the contract between the planner LLM and the execution engine. Chat mode does not require a plan; task mode centers on it.
+
+**Provider selection** (see `backend/acp/factory.py`):
+
+```mermaid
+flowchart TD
+    mockQ{CODEX_MOCK true?}
+    acpQ{ACP binary on PATH and ACP_BACKEND not legacy?}
+    mockQ -->|yes| Mock[MockProvider]
+    mockQ -->|no| acpQ
+    acpQ -->|yes| ACP[AcpProvider + AcpSessionManager]
+    acpQ -->|no| Leg[LegacyCodexProvider codex exec]
+```
 
 ---
 
-## Request Lifecycle
+## Streamlit: Chat vs Task
 
-### Step 1 — Create task (`POST /tasks`)
+| Concept | Behavior |
+|---------|-----------|
+| **Chat mode** | Default. Messages go to `POST /chat` with optional `file_context` from cached schema profile. |
+| **Task mode** | User sends `/task <question>`. Creates `POST /tasks`, shows plan card; further messages can revise plan via `POST /tasks/{id}/revise` until confirmed. |
+| **Schema cache** | `POST /data/profile` refreshes profile when file changes; used to populate chat context without a task id. |
+| **Completion** | After results, UI can “mark complete” (back to chat) or “replan” (new task with combined feedback). |
 
-1. Frontend sends the uploaded file + natural language question.
-2. `schema_profiler.profile_upload()` parses the file into a `pd.DataFrame` and extracts column names, dtypes, null counts, and sample values.
-3. The schema profile is passed to the **Codex adapter** (`generate_plan`), which returns an `AnalysisPlan`.
-4. The task is stored in memory (`backend/storage.py`) with status `planned`.
-5. The DataFrame is also kept in memory keyed by `task_id`.
+Sidebar shows current **mode** and **active_task_id** for debugging.
 
-### Step 2 — Review plan (`GET /tasks/{id}`, `Plan` + `Review` tabs)
+---
 
-1. Frontend fetches the task and displays the plan as editable JSON.
-2. The user can modify any field: add/remove filters, change aggregation, adjust chart type.
-3. If `confidence < 0.6` or `ambiguities` is non-empty, the UI warns the user.
+## LLM & Agent Runtime (`backend/acp/`)
 
-### Step 3 — Submit review and run (`POST /tasks/{id}/review`)
+All non-mock LLM entry points go through **`get_provider()`**. The public surface is five async methods: `generate_plan`, `generate_summary`, `generate_followups`, `chat`, `revise_plan`.
 
-1. Frontend sends the (possibly edited) `final_plan`.
-2. Backend calls `execution.engine.run_plan(df, final_plan)` which applies filters, groupby/aggregation, and builds chart + table payloads.
-3. The adapter is called again for `generate_summary` and `generate_followups`.
-4. Task status transitions: `reviewing` → `running` → `completed` (or `failed`).
+| Module | Role |
+|--------|------|
+| `factory.py` | Chooses provider; owns singleton `AcpSessionManager`; `shutdown_providers()` on app lifespan exit. |
+| `client.py` | `AnalysisAcpClient` (ACP callback impl) + `AcpSessionManager` (`initialize`, `session/new`, `session/prompt`, stream accumulation). Imports **`acp` lazily** so missing `agent-client-protocol` does not break mock-only startup. |
+| `provider.py` | `AcpProvider` — builds prompts from `backend/codex/prompts.py`, calls `prompt_for(logical_key, text)`, parses JSON. |
+| `legacy_codex.py` | `LegacyCodexProvider` — previous `codex exec` one-shot behavior. |
+| `mock.py` | `MockProvider` — deterministic plans and canned chat. |
+| `json_util.py` | Extract JSON object/array from noisy LLM text. |
+| `errors.py` | `CodexAdapterError` (shared). |
 
-### Step 4 — Fetch result (`GET /tasks/{id}/result`)
+**Shims:** `backend/codex/adapter.py` and `backend/codex/mock.py` re-export legacy/mock types for older imports (e.g. scripts).
 
-Returns `ResultPayload`: chart data, table rows, execution summary, LLM summary, and follow-up questions.
+### ACP sessions
+
+- One **agent subprocess** per FastAPI process (shared singleton).
+- **Logical keys** → ACP `session_id`: e.g. each `task_id` for plan/summary/followups/revise; a fixed env key (`ACP_CHAT_SESSION_KEY`) for `/chat` so follow-ups share context.
+- **`session/new` `cwd`:** `ACP_SESSION_CWD` or repo root (see `factory._acp_session_cwd`). Codex discovers `.agents/skills` and `AGENTS.md` from this directory.
+
+### Skills & prompts (`backend/skills/` + `.agents/skills/`)
+
+- **SkillRegistry** scans `.agents/skills/*/SKILL.md`, parses frontmatter, lazy-loads bodies.
+- **`build_*_prompt(..., skill_instructions=...)`** in `prompts.py` prepends an optional `## Skill Context` block.
+- **Injection policy** (`acp_agent_uses_native_skills()`): if the ACP command looks like Codex (`codex` in `ACP_AGENT_COMMAND`) and `ACP_AGENT_NATIVE_SKILLS` is not forced off, skills are **not** duplicated into prompts. **Legacy** provider always injects (subprocess does not load repo skills).
+
+---
+
+## Request Lifecycles
+
+### A — Structured task (`/tasks`)
+
+1. **`POST /tasks`** — File + question → profiler → `generate_plan` → store `TaskRecord` (`planned`) + DataFrame in memory.
+2. **Review** — UI loads plan; user may edit JSON.
+3. **`POST /tasks/{id}/revise`** (optional) — User message while plan pending → `revise_plan` → updated `AnalysisPlan`.
+4. **`POST /tasks/{id}/review`** — `final_plan` → `run_plan` → `generate_summary` + `generate_followups` → `completed` / `failed`.
+5. **`GET /tasks/{id}/result`** — `ResultPayload`.
+
+### B — Free-form chat (`POST /chat`)
+
+JSON body: `message`, `history[]`, optional `file_context` (schema profile dict), optional `use_mock`. Returns `{ "reply": "..." }`. Does not mutate task storage.
+
+### C — Profile only (`POST /data/profile`)
+
+Upload file → same profiler as tasks → returns **schema_profile** JSON only (no `TaskRecord`).
 
 ---
 
 ## Key Data Structures
 
-All schemas live in `backend/schemas/`. They are Pydantic models — read them as the canonical contract between layers.
+Canonical Pydantic models live in `backend/schemas/`.
 
 ### `AnalysisPlan` (`schemas/plan.py`)
 
-The central object. Produced by the Codex adapter, consumed by the execution engine.
+Produced by the planner (and reviser), consumed by `execution.engine.run_plan`.
 
 ```
-AnalysisPlan
-├── goal: str                         # human-readable description of intent
-├── metrics: list[MetricSpec]         # what to compute (column + aggregation + alias)
-├── dimensions: list[DimensionSpec]   # what to group by (column + role: time/category/geo)
-├── filters: list[FilterSpec]         # row filters (column + operator + value)
-├── output: OutputSpec                # chart_type (line/bar/histogram) + show_table
-├── ambiguities: list[AmbiguitySpec]  # fields the LLM was uncertain about
-└── confidence: float | None          # 0.0–1.0 self-reported plan quality
+goal, metrics[], dimensions[], filters[], output{chart_type, show_table},
+ambiguities[], confidence
 ```
 
 ### `TaskRecord` (`schemas/task.py`)
 
-Tracks the full lifecycle of one analysis request.
-
-```
-TaskRecord
-├── task_id: str
-├── status: TaskStatus   # created → planned → reviewing → running → completed/failed
-├── input: TaskInput     # question, filename, row/column counts
-├── plan: AnalysisPlan   # LLM-generated plan (before user review)
-├── final_plan: AnalysisPlan | None   # plan after user edits
-├── result: ResultPayload | None
-└── error: TaskError | None
-```
+`status`: `created` → `planned` → `reviewing` → `running` → `completed` | `failed`
 
 ### `ResultPayload` (`schemas/result.py`)
 
-```
-ResultPayload
-├── chart: ChartPayload     # chart_type, x/y column names, data rows
-├── table: TablePayload     # columns list + rows as list[dict]
-├── execution_summary: str  # human-readable description of what pandas did
-├── summary: str | None     # LLM-generated narrative summary
-└── follow_ups: list[str]   # 3 suggested follow-up questions
-```
+`chart`, `table`, `execution_summary`, `summary`, `follow_ups[]`
 
 ---
 
-## The Codex Adapter Layer (`backend/codex/`)
+## Prompts (`backend/codex/prompts.py`)
 
-This is the most important abstraction in the codebase. It isolates all LLM interaction so the rest of the system does not care whether it is talking to a real CLI or a mock.
+| Function | Used for |
+|----------|-----------|
+| `build_plan_prompt` | Initial plan JSON |
+| `build_revise_plan_prompt` | Full plan rewrite from user instruction |
+| `build_summary_prompt` | Chinese narrative after execution |
+| `build_followups_prompt` | JSON array of 3 strings |
+| `build_chat_prompt` | Plain-text conversational reply |
 
-### `adapter.py` — `CodexAdapter`
-
-Calls Codex CLI as a subprocess:
-
-```python
-await asyncio.create_subprocess_exec("codex", "exec", prompt, ...)
-```
-
-Output is raw text. `_extract_json_payload()` tries two strategies:
-1. Direct `json.loads()` on the full output.
-2. Locate the first `{` and last `}` and parse that substring.
-
-If both fail, `CodexAdapterError` is raised and the router falls back to `MockAdapter`.
-
-Configured via environment variables: `CODEX_CLI_COMMAND`, `CODEX_TIMEOUT_SECONDS`, `CODEX_RETRY_COUNT`.
-
-### `mock.py` — `MockAdapter`
-
-Produces deterministic plans without any CLI call. Uses simple heuristics:
-- Picks a numeric column as the metric.
-- Picks a date/time column as the time dimension.
-- Picks a category column (region, dept, product…) as the group-by dimension.
-- Detects keywords like "华东" or "分布" to add filters or change chart type.
-
-**Use this for all local development and CI.** Set `CODEX_MOCK=true` (the default).
-
-### `prompts.py`
-
-Three prompt builders:
-- `build_plan_prompt` — instructs Codex to return a JSON `AnalysisPlan`.
-- `build_summary_prompt` — instructs Codex to return a 2–4 sentence Chinese summary.
-- `build_followups_prompt` — instructs Codex to return a JSON array of 3 follow-up questions.
-
-**To improve plan quality, edit the prompts here.** The output schema in `build_plan_prompt` must stay in sync with `AnalysisPlan`.
-
-### Auto-degrade
-
-If Codex fails `CODEX_AUTO_MOCK_THRESHOLD` times in a row (default 3), the backend automatically sets `CODEX_MOCK=true` for the remainder of the process lifetime. This prevents cascading failures when the CLI is unavailable.
+**Quality work:** tune rules in prompts **and** in `.agents/skills/*/SKILL.md` (keep them aligned). The JSON schema string in `build_plan_prompt` must stay consistent with `AnalysisPlan`.
 
 ---
 
-## The Execution Engine (`backend/execution/engine.py`)
+## Execution Engine (`backend/execution/engine.py`)
 
-`run_plan(df, plan) → ResultPayload`
-
-Pure pandas. No LLM involved. Three stages:
-
-1. **`_apply_filters`** — iterates `plan.filters`, applies pandas boolean masks. Skips any filter referencing a column not in the DataFrame (safe degradation).
-2. **`_aggregate`** — if `plan.metrics` is non-empty, calls `df.groupby(dimensions).agg(metrics)`. If no dimensions, aggregates the whole DataFrame. Caps output at 500 rows.
-3. **`_build_chart`** — picks x/y columns and formats `ChartPayload`. For histograms, uses `value_counts()`.
-
-**To add a new aggregation type**, add it to `Aggregation` enum in `schemas/plan.py` — the engine uses `metric.aggregation.value` directly as the pandas agg string, so `"sum"`, `"mean"`, etc. work automatically.
-
-**To add a new filter operator**, add it to `FilterOperator` enum and add a branch in `_apply_filters`.
+`run_plan(df, plan) → ResultPayload` — pure pandas. See existing doc sections: `_apply_filters`, `_aggregate`, `_build_chart`. Extend `Aggregation` / `FilterOperator` / `ChartType` in `schemas/plan.py` when adding capabilities.
 
 ---
 
-## The Schema Profiler (`backend/profiler/schema_profiler.py`)
+## Schema Profiler (`backend/profiler/schema_profiler.py`)
 
-`profile_upload(file: UploadFile) → (pd.DataFrame, dict)`
-
-Accepts `.csv`, `.xlsx`, `.xls`. Rejects empty files. If the file has more than 10,000 rows, it samples 10,000 rows randomly (reproducible with `random_state=42`).
-
-The returned `dict` is the schema profile passed to the Codex adapter. It contains column names, dtypes, null counts, and up to 5 sample values per column. This gives the LLM enough context to map natural language column references to actual column names.
+`profile_upload` — CSV / XLSX / XLS; samples large files; returns `(DataFrame, schema_profile dict)` used by tasks, chat context, and `/data/profile`.
 
 ---
 
-## Observability (`backend/observability.py`)
+## Observability & Storage
 
-Every task produces two kinds of artifacts, written to `artifacts/` (auto-created):
-
-| Artifact | Location | What it contains |
-|----------|----------|-----------------|
-| Event log | `artifacts/events.log` | One JSON line per event: `ts`, `task_id`, `stage`, `event_type`, `payload` |
-| Snapshots | `artifacts/tasks/<task_id>/<name>.json` | Full JSON dump of input, schema_profile, plan, final_plan, result, errors, diffs |
-
-**To debug a failed task**, find its `task_id` in the UI, then read `artifacts/tasks/<task_id>/`. The `review_diff.json` snapshot shows exactly what the user changed in the Review tab.
+Unchanged MVP behavior: `artifacts/events.log`, `artifacts/tasks/<task_id>/*.json`, in-memory `TASKS` / `TASK_DATAFRAMES` / `TASK_SNAPSHOTS` in `backend/storage.py` (lost on restart).
 
 ---
 
-## Storage (`backend/storage.py`)
-
-Three in-memory dicts, module-level:
-
-| Dict | Key | Value |
-|------|-----|-------|
-| `TASKS` | `task_id` | `TaskRecord` |
-| `TASK_DATAFRAMES` | `task_id` | `pd.DataFrame` |
-| `TASK_SNAPSHOTS` | `task_id` | raw schema profile dict |
-
-**All state is lost on server restart.** This is intentional for the MVP. To add persistence, replace these dicts with a database (SQLite is the natural next step — see "What's not implemented" below).
-
----
-
-## API Endpoints
-
-All routes are under `/tasks` (`backend/routers/tasks.py`).
+## HTTP API Reference
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `POST` | `/tasks` | Create task: upload file + question → returns plan |
-| `GET` | `/tasks/{id}` | Get full `TaskRecord` |
-| `POST` | `/tasks/{id}/review` | Submit final plan → runs execution → returns completed record |
-| `GET` | `/tasks/{id}/result` | Get `ResultPayload` (or status if not ready) |
-| `POST` | `/tasks/{id}/fail` | Dev utility: manually mark task as failed |
-| `POST` | `/tasks/{id}/reset` | Recovery: reset stuck task back to `planned` |
+| `GET` | `/` | Service banner |
+| `GET` | `/health` | Liveness |
+| `GET` | `/skills` | List skill metadata (`name`, `description`, `path`) |
+| `POST` | `/chat` | Free-form assistant message |
+| `POST` | `/data/profile` | Upload file → schema profile only |
+| `POST` | `/tasks` | Create task → plan |
+| `GET` | `/tasks/{id}` | Full `TaskRecord` |
+| `POST` | `/tasks/{id}/revise` | Revise pending plan from natural language |
+| `POST` | `/tasks/{id}/review` | Submit `final_plan` → execute |
+| `GET` | `/tasks/{id}/result` | `ResultPayload` or status |
+| `POST` | `/tasks/{id}/fail` | Dev: force failed |
+| `POST` | `/tasks/{id}/reset` | Reset to `planned` |
 
-Interactive docs: `http://127.0.0.1:8000/docs`
+Swagger: `http://127.0.0.1:8000/docs`
 
 ---
 
-## Adding a New Feature — Checklist
+## Step-by-Step Developer Walkthrough
 
-### New filter operator
+### Prerequisites
 
-1. Add value to `FilterOperator` in `backend/schemas/plan.py`.
-2. Add branch in `_apply_filters` in `backend/execution/engine.py`.
-3. Update the output schema string in `build_plan_prompt` in `backend/codex/prompts.py`.
-4. Add a regression case in `tests/fixtures/cases.json` + matching CSV.
+Python **3.12+**, **`uv`**. Codex CLI **optional** if `CODEX_MOCK=true`.
 
-### New chart type
+```bash
+uv sync
+uv run python -c "import fastapi, streamlit; print('OK')"
+```
 
-1. Add value to `ChartType` in `backend/schemas/plan.py`.
-2. Add rendering branch in `_draw_chart` in `app/streamlit_app.py`.
-3. Add chart-building logic in `_build_chart` in `backend/execution/engine.py`.
+### Layer 0 — Regression (no server)
 
-### New LLM capability (e.g. anomaly detection)
+```bash
+uv run python tests/run_regression.py --mode mock
+```
 
-1. Add a prompt builder in `backend/codex/prompts.py`.
-2. Add a method to `CodexAdapter` and `MockAdapter` (keep both in sync).
-3. Call it from the appropriate router endpoint.
-4. Add a new field to the relevant schema if the output needs to be stored.
+Expect all cases `ok` (exercises mock provider + engine + schemas).
+
+### Layer 1 — Backend API
+
+```bash
+uv run uvicorn backend.main:app --reload
+```
+
+- `curl http://127.0.0.1:8000/health`
+- `curl http://127.0.0.1:8000/skills` — should list registered skills when `.agents/skills` exists.
+- Create task (same as before): `POST /tasks` with form file + question.
+- Optional: `POST /chat` with JSON `{"message":"hello","history":[]}`.
+
+### Layer 2 — Streamlit
+
+```bash
+uv run streamlit run app/streamlit_app.py
+```
+
+Upload a fixture CSV, send a chat line, then `/task …` and complete review → results.
+
+### Debugging
+
+| Check | Location |
+|-------|-----------|
+| Backend logs | uvicorn terminal |
+| Events | `artifacts/events.log` |
+| Per-task | `artifacts/tasks/<task_id>/` |
+| Provider transport | Snapshots may include `"transport": "acp"` vs legacy |
+
+### Common Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `No module named 'acp'` | `agent-client-protocol` not installed | `uv sync` |
+| `ImportError: ACP mode requires 'agent-client-protocol'` | Mock disabled, SDK missing | Install package or use mock |
+| `ModuleNotFoundError: No module named 'backend'` | Wrong CWD | Run from repo root |
+| Port 8000 in use | Stale uvicorn | Kill process or change port |
+| Streamlit `ConnectionRefusedError` | Backend down | Start API first |
+| Empty chart | Filters too strict | Relax plan filters |
+| Codex ignores skills | Wrong ACP cwd | Set `ACP_SESSION_CWD` to repo root |
+
+---
+
+## Adding a Feature — Checklist
+
+### New filter / chart / aggregation
+
+1. Update `backend/schemas/plan.py` enums.
+2. Update `backend/execution/engine.py` (`_apply_filters` / `_build_chart` / agg path).
+3. Update `build_plan_prompt` + matching `.agents/skills/analysis-planner/SKILL.md` if used.
+4. Add regression case in `tests/fixtures/`.
+
+### New LLM surface
+
+1. Add `build_*_prompt` in `prompts.py` (optional `skill_instructions`).
+2. Add method on **MockProvider**, **AcpProvider**, and **LegacyCodexProvider** (keep parity).
+3. Expose via router; wire Streamlit if user-facing.
 
 ### Improve plan quality
 
-Edit `build_plan_prompt` in `backend/codex/prompts.py`. The most impactful changes:
-- Add more example column names to help the model map natural language to schema columns.
-- Add few-shot examples of good plans.
-- Tighten the output schema description to reduce hallucinated field names.
+Edit prompts **and** skill markdown; add few-shot examples; tighten JSON shape description.
 
 ---
 
 ## Running Tests
 
 ```bash
-# Regression suite (mock mode — no Codex CLI needed)
 uv run python tests/run_regression.py --mode mock
-
-# Regression suite (real mode — requires Codex CLI)
-uv run python tests/run_regression.py --mode real
+uv run python tests/run_regression.py --mode real   # requires Codex CLI
 ```
-
-Test fixtures are in `tests/fixtures/`. Each entry in `cases.json` specifies:
-- `name` — test case identifier
-- `file` — CSV filename relative to `fixtures/`
-- `question` — natural language question
-- `expected_chart_type` — `"line"`, `"bar"`, or `"histogram"`
-- `expected_metric_column` — expected output column name (informational)
-
-To add a new test case: drop a CSV into `tests/fixtures/` and add an entry to `cases.json`.
 
 ---
 
-## What Is Deliberately Not Implemented (MVP Boundaries)
-
-These are known gaps, not bugs. They are deferred to keep the MVP scope manageable.
+## MVP Boundaries (Updated)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Persistent storage | Not implemented | In-memory only; restart loses all tasks |
-| Authentication | Not implemented | No user accounts or API keys |
-| Multi-turn conversation / memory | Not implemented | Each task is independent |
-| Skill library | Not implemented | No reusable analysis templates |
-| ACP / agent protocol integration | Not implemented | Codex CLI is called directly |
-| Streaming responses | Not implemented | All results returned synchronously |
-| Excel output | Not implemented | Table download is CSV only |
+| Persistent storage | Not implemented | In-memory tasks only |
+| Authentication | Not implemented | — |
+| Long-term user memory | Not implemented | ACP session = process-scoped context |
+| **Skill library (repo)** | **Partial** | `.agents/skills` + registry + injection; no UI editor / artifact→skill loop |
+| **ACP integration** | **Implemented** | Optional; requires agent binary + SDK |
+| **Chat + task modes** | **Implemented** | Streamlit + `/chat` + `/tasks` + revise |
+| Streaming to browser | Not implemented | ACP streams aggregated server-side only |
+| Excel export | Not implemented | Table CSV only |
 | Multi-file joins | Not implemented | One file per task |
-| Column-level access control | Not implemented | All columns visible to LLM |
+| Column ACL | Not implemented | — |
 
 ---
 
@@ -291,12 +294,18 @@ These are known gaps, not bugs. They are deferred to keep the MVP scope manageab
 
 | Package | Purpose |
 |---------|---------|
-| `fastapi` + `uvicorn` | Backend API server |
-| `streamlit` | Frontend UI |
-| `pandas` + `numpy` | Data manipulation in execution engine |
-| `pydantic` | Schema validation for all data contracts |
-| `python-multipart` | Required by FastAPI for file uploads |
-| `requests` | Used by Streamlit to call the backend |
-| `uv` | Package manager and virtual environment |
+| `fastapi`, `uvicorn` | API |
+| `streamlit` | UI |
+| `pandas`, `numpy` | Execution |
+| `pydantic` | Schemas |
+| `python-multipart` | Uploads |
+| `requests` | Streamlit → HTTP |
+| **`agent-client-protocol`** | ACP client (`import acp`); lazy-loaded in `backend/acp/client.py` |
 
-Codex CLI is **not** a Python package. It must be installed separately and available on `PATH` (or pointed to via `CODEX_CLI_COMMAND`). When `CODEX_MOCK=true`, it is never called.
+**Codex CLI** / **`codex-acp`** are not Python packages — install separately and ensure `PATH` (or override env vars). With `CODEX_MOCK=true`, neither is invoked.
+
+---
+
+## Legacy: Original “Codex adapter” narrative
+
+The historical **CodexAdapter** one-shot subprocess implementation now lives in **`LegacyCodexProvider`** (`backend/acp/legacy_codex.py`). `backend/codex/adapter.py` is a **shim** for backward compatibility. New code should depend on **`get_provider()`** or types under `backend.acp`.
