@@ -114,12 +114,36 @@ def _run_codex_sql_generator_prompt(
             ]
         )
         t0 = time.perf_counter()
-        completed = subprocess.run(
-            argv,
-            input=prompt.encode("utf-8"),
-            capture_output=True,
-            timeout=int(timeout_s),
-        )
+        try:
+            completed = subprocess.run(
+                argv,
+                input=prompt.encode("utf-8"),
+                capture_output=True,
+                timeout=int(timeout_s),
+            )
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.perf_counter() - t0
+            stderr = f"[argv] {json.dumps(argv, ensure_ascii=False)}\n"
+            stderr += f"[timeout] timed out after {timeout_s}s\n"
+            stderr += f"[exception] {exc}\n"
+            if out_dir_resolved:
+                stderr_path = out_dir_resolved / f"codex_stderr__{case_id}__{mode}.txt"
+                try:
+                    stderr_path.write_text(stderr, encoding="utf-8", newline="\n")
+                except OSError:
+                    pass
+            return SqlGeneratorJsonStreamResult(
+                argv=argv,
+                case_id=case_id,
+                mode=mode,
+                jsonl_text="",
+                last_message="",
+                stderr=stderr,
+                elapsed_s=elapsed,
+                returncode=124,
+                jsonl_path=jsonl_path,
+                last_message_path=last_msg_path,
+            )
         elapsed = time.perf_counter() - t0
 
         jsonl_raw = (completed.stdout or b"").decode("utf-8", errors="replace")
