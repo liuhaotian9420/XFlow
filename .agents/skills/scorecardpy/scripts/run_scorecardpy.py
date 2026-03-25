@@ -234,6 +234,10 @@ def fit_pipeline(df: pd.DataFrame, cfg: RunConfig) -> dict:
     test_woe = sc.woebin_ply(test_df[[cfg.target] + used_x_cols], bins)
 
     woe_cols = [c for c in train_woe.columns if c.endswith("_woe")]
+    # scorecardpy can leave NaN in WOE outputs for sparse / unseen bins on small samples.
+    # Fill with 0 so the downstream logistic regression remains numerically valid.
+    train_woe[woe_cols] = train_woe[woe_cols].fillna(0)
+    test_woe[woe_cols] = test_woe[woe_cols].fillna(0)
     lr = LogisticRegression(max_iter=cfg.max_iter)
     lr.fit(train_woe[woe_cols], train_woe[cfg.target])
 

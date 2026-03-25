@@ -15,3 +15,8 @@ notes/
 tmp_files/
 tmp_files2/
 tmp_smoke.sql
+
+# Never commit credentials or skill run scratch
+.agents/skills/**/scripts/.env
+.agents/skills/**/water.json
+.agents/skills/dataworks/tmp_dummy.sql
