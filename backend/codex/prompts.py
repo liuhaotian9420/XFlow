@@ -5,36 +5,15 @@ from __future__ import annotations
 import json
 
 
-def _skill_context_block(skill_instructions: str | None) -> str:
-    """Optional prefix from ``SKILL.md`` body (injected for non-native agents)."""
-    if not skill_instructions or not str(skill_instructions).strip():
-        return ""
-    return f"## Skill Context\n\n{skill_instructions.strip()}\n\n---\n\n"
-
-
 def build_plan_prompt(
     question: str,
     schema_profile: dict,
     *,
-    skill_instructions: str | None = None,
+    skill_hint: str = "$analysis-planner",
 ) -> str:
     schema_json = json.dumps(schema_profile, ensure_ascii=False, indent=2)
-    example = """
-{
-  "goal": "Compare sales by region last quarter",
-  "metrics": [{"column": "amount", "aggregation": "sum", "alias": "amount_sum"}],
-  "dimensions": [
-    {"column": "date", "role": "time"},
-    {"column": "region", "role": "category"}
-  ],
-  "filters": [{"column": "region", "operator": "eq", "value": "华东"}],
-  "output": {"chart_type": "line", "show_table": true},
-  "ambiguities": [{"field": "date", "issue": "Assuming column date is parseable as time"}],
-  "confidence": 0.75
-}
-""".strip()
-    prefix = _skill_context_block(skill_instructions)
-    return f"""{prefix}You are an analysis planning assistant for tabular data.
+    return f"""You are an analysis planning assistant for tabular data.
+Skill hint: {skill_hint}
 
 CRITICAL output rules:
 - Respond with ONE JSON object only.
@@ -44,17 +23,7 @@ CRITICAL output rules:
 - "operator" must be one of: eq, neq, gt, gte, lt, lte, in, not_in, contains.
 - "role" must be one of: time, category, geo.
 - "chart_type" must be one of: line, bar, histogram.
-- Chart selection (match the user's intent):
-  - Use "line" for time trends: words like 趋势, 变化, 走势, 增长, 按月, 按日, trend, over time.
-  - Use "bar" for category comparison: 对比, 比较, 各部门, 各区域, 排名, compare.
-  - Use "histogram" when the user asks for 分布, distribution, 频率分布, or per-category share of a single numeric measure (e.g. 各渠道流量分布): set chart_type to "histogram", not "bar".
-  - Use "bar" only for explicit side-by-side comparison of metrics across categories (对比/比较), not for 分布 wording.
-- Filters on date/time columns: use operators gt, gte, lt, lte, eq with concrete values (e.g. ISO dates "2025-01-01") when possible. Do NOT use operator "contains" on date columns with vague Chinese phrases — that usually filters out all rows.
-- If row_count in the schema is small (under ~20), keep filters minimal so the result is not empty unless the user clearly requires a strict slice.
 - Set "confidence" between 0.0 and 1.0. List real uncertainties in "ambiguities".
-
-Example of valid output (structure only; adapt columns to the real schema):
-{example}
 
 Question:
 {question}
@@ -87,12 +56,9 @@ Output JSON must match this shape (field names and types):
 def build_summary_prompt(
     goal: str,
     result_summary: dict,
-    *,
-    skill_instructions: str | None = None,
 ) -> str:
     result_json = json.dumps(result_summary, ensure_ascii=False, indent=2)
-    prefix = _skill_context_block(skill_instructions)
-    return f"""{prefix}You are a data analysis explainer.
+    return f"""You are a data analysis explainer.
 Return plain text summary in Chinese, 2-4 short sentences.
 
 Goal:
@@ -108,7 +74,7 @@ def build_chat_prompt(
     history: list[dict],
     file_context: dict | None,
     *,
-    skill_instructions: str | None = None,
+    skill_hint: str = "$data-chat",
 ) -> str:
     """Build a conversational prompt (plain-text reply, not JSON)."""
     history_lines: list[str] = []
@@ -136,8 +102,8 @@ No file schema is loaded yet. You may answer general questions. For questions th
 row statistics, briefly ask the user to attach CSV/Excel (paperclip) and optionally use /task to run a structured plan.
 """.strip()
 
-    prefix = _skill_context_block(skill_instructions)
-    return f"""{prefix}You are a helpful data-analysis assistant in a workbench app.
+    return f"""You are a helpful data-analysis assistant in a workbench app.
+Skill hint: {skill_hint}
 
 Rules:
 - Reply in the same language as the user's latest message when possible (Chinese or English).
@@ -160,13 +126,13 @@ def build_revise_plan_prompt(
     instruction: str,
     schema_profile: dict,
     *,
-    skill_instructions: str | None = None,
+    skill_hint: str = "$plan-reviser",
 ) -> str:
     """Ask the model to return a full revised AnalysisPlan JSON."""
     plan_json = json.dumps(current_plan, ensure_ascii=False, indent=2)
     schema_json = json.dumps(schema_profile, ensure_ascii=False, indent=2)
-    prefix = _skill_context_block(skill_instructions)
-    return f"""{prefix}You are an analysis planning assistant. The user asked to REVISE an existing analysis plan based on their feedback.
+    return f"""You are an analysis planning assistant. The user asked to REVISE an existing analysis plan based on their feedback.
+Skill hint: {skill_hint}
 
 CRITICAL output rules:
 - Respond with ONE JSON object only (the full revised plan).
@@ -196,19 +162,16 @@ Output: one JSON object matching the AnalysisPlan shape.
 def build_followups_prompt(
     goal: str,
     result_summary: dict,
-    *,
-    skill_instructions: str | None = None,
 ) -> str:
     result_json = json.dumps(result_summary, ensure_ascii=False, indent=2)
-    prefix = _skill_context_block(skill_instructions)
-    return f"""{prefix}You are a data analysis assistant.
+    return f"""You are a data analysis assistant.
 
 Generate exactly 3 short follow-up questions in Chinese.
 
 Output rules:
 - Return ONE JSON array of 3 strings only.
 - No markdown, no code fences, no other text.
-Example: ["是否需要按月份继续下钻？", "是否要对比其他区域？", "是否需要导出明细？"]
+Example: ["鏄惁闇€瑕佹寜鏈堜唤缁х画涓嬮捇锛?, "鏄惁瑕佸姣斿叾浠栧尯鍩燂紵", "鏄惁闇€瑕佸鍑烘槑缁嗭紵"]
 
 Goal:
 {goal}

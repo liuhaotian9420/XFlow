@@ -3,3 +3,15 @@
 __pycache__/
 *.pyc
 artifacts/
+
+# E2E / local DuckDB under skills assets (keep directory via .gitkeep only)
+.agents/assets/*
+!.agents/assets/.gitkeep
+
+# Local / tool noise (do not commit)
+.cursor/
+.playwright-mcp/
+notes/
+tmp_files/
+tmp_files2/
+tmp_smoke.sql

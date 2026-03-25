@@ -39,7 +39,8 @@ Streamlit UI (app/streamlit_app.py)
 ## 技能体系
 
 - SkillRegistry 扫描 `.agents/skills/*/SKILL.md`
-- 规划/对话/改计划提示词都会注入技能正文
+- 运行时依赖 Codex 原生 skills discovery/progressive disclosure
+- 提示词仅传短显式 hint（例如 `$analysis-planner`），不再注入技能全文
 - 元数据接口：`GET /skills`
 
 ## 主要请求链路

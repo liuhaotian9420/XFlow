@@ -17,6 +17,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from backend.codex.errors import CodexAdapterError
+from backend.codex.jsonl_encoding_fix import repair_jsonl_text
 from backend.codex.json_util import extract_json_array_payload, extract_json_payload
 from backend.codex.prompts import (
     build_chat_prompt,
@@ -32,7 +33,6 @@ from backend.skills import (
     SKILL_ANALYSIS_PLANNER,
     SKILL_DATA_CHAT,
     SKILL_PLAN_REVISER,
-    skill_instructions_for_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,12 +83,10 @@ def _codex_exec_config_args(
 
     disable_mcp = os.getenv("CODEX_DISABLE_MCP", "true").strip().lower()
     if disable_mcp not in ("0", "false", "no", "off"):
-        raw_servers = os.getenv(
-            "CODEX_MCP_DISABLE_SERVERS", "notion,linear,figma,playwright"
-        ).strip()
-        servers = [s.strip() for s in raw_servers.split(",") if s.strip()]
-        for server in servers:
-            parts.extend(["-c", f"mcp_servers.{server}.enabled=false"])
+        # Avoid per-server partial overrides like
+        # `mcp_servers.<name>.enabled=false`; some Codex CLI builds treat these
+        # as incomplete server definitions and fail validation ("invalid transport").
+        parts.extend(["-c", "mcp_servers={}"])
 
     raw = os.getenv("CODEX_HTTP_TRANSPORT_ONLY", "true").strip().lower()
     if raw not in ("0", "false", "no", "off"):
@@ -249,22 +247,30 @@ class LegacyCodexProvider:
     last_input_tokens: int | None = None
     last_output_tokens: int | None = None
     last_cached_input_tokens: int | None = None
+    last_skill_hints: list[str] | None = None
 
     async def generate_plan(
         self, question: str, schema_profile: dict, task_id: str = "unknown"
     ) -> AnalysisPlan:
-        si = skill_instructions_for_prompt(SKILL_ANALYSIS_PLANNER, inject=True)
+        self.last_skill_hints = [SKILL_ANALYSIS_PLANNER]
+        self.last_input_tokens = None
+        self.last_output_tokens = None
+        self.last_cached_input_tokens = None
         prompt = build_plan_prompt(
             question=question,
             schema_profile=schema_profile,
-            skill_instructions=si,
+            skill_hint=f"${SKILL_ANALYSIS_PLANNER}",
         )
         last_error: Exception | None = None
         last_stdout: str | None = None
         for _ in range(self.retry_count + 1):
             raw: str | None = None
             try:
-                raw = await self._run_prompt(prompt)
+                raw, usage = await self._run_prompt_with_usage(prompt)
+                if usage is not None:
+                    self.last_input_tokens = usage.get("input_tokens")
+                    self.last_output_tokens = usage.get("output_tokens")
+                    self.last_cached_input_tokens = usage.get("cached_input_tokens")
                 last_stdout = raw
                 payload = extract_json_payload(raw)
                 plan = AnalysisPlan.model_validate(payload)
@@ -273,8 +279,10 @@ class LegacyCodexProvider:
                     "codex_plan_call",
                     {
                         "prompt": prompt,
+                        "skill_hints": self.last_skill_hints,
                         "raw_output": raw,
                         "parsed_result": payload,
+                        "usage": usage or {},
                         "parse_success": True,
                     },
                 )
@@ -287,6 +295,7 @@ class LegacyCodexProvider:
                     "plan",
                     "codex_call",
                     {
+                        "skill_hints": self.last_skill_hints,
                         "parse_success": False,
                         "error": _format_exception_for_logs(exc),
                     },
@@ -303,6 +312,7 @@ class LegacyCodexProvider:
     async def generate_summary(
         self, goal: str, result_df_summary: dict, task_id: str = "unknown"
     ) -> str:
+        self.last_skill_hints = None
         prompt = build_summary_prompt(goal=goal, result_summary=result_df_summary)
         raw = await self._run_prompt(prompt)
         save_snapshot(
@@ -316,6 +326,7 @@ class LegacyCodexProvider:
     async def generate_followups(
         self, goal: str, result_df_summary: dict, task_id: str = "unknown"
     ) -> list[str]:
+        self.last_skill_hints = None
         prompt = build_followups_prompt(goal=goal, result_summary=result_df_summary)
         raw = await self._run_prompt(prompt)
         try:
@@ -345,13 +356,13 @@ class LegacyCodexProvider:
         self.last_ttft_elapsed_s = None
         self.last_generation_elapsed_s = None
         self.last_teardown_elapsed_s = None
-        si = skill_instructions_for_prompt(SKILL_DATA_CHAT, inject=True)
+        self.last_skill_hints = [SKILL_DATA_CHAT]
         prompt_started = time.perf_counter()
         prompt = build_chat_prompt(
             message=message,
             history=history,
             file_context=file_context,
-            skill_instructions=si,
+            skill_hint=f"${SKILL_DATA_CHAT}",
         )
         self.last_chat_prompt_text = prompt
         self.last_chat_prompt_build_elapsed_s = time.perf_counter() - prompt_started
@@ -365,6 +376,7 @@ class LegacyCodexProvider:
             "codex_chat_call",
             {
                 "prompt": prompt,
+                "skill_hints": self.last_skill_hints,
                 "raw_output": raw,
                 "parse_success": True,
                 "usage": usage or {},
@@ -381,19 +393,26 @@ class LegacyCodexProvider:
         schema_profile: dict,
         task_id: str = "unknown",
     ) -> AnalysisPlan:
-        si = skill_instructions_for_prompt(SKILL_PLAN_REVISER, inject=True)
+        self.last_skill_hints = [SKILL_PLAN_REVISER]
+        self.last_input_tokens = None
+        self.last_output_tokens = None
+        self.last_cached_input_tokens = None
         prompt = build_revise_plan_prompt(
             current_plan=current_plan.model_dump(),
             instruction=instruction,
             schema_profile=schema_profile,
-            skill_instructions=si,
+            skill_hint=f"${SKILL_PLAN_REVISER}",
         )
         last_error: Exception | None = None
         last_stdout: str | None = None
         for _ in range(self.retry_count + 1):
             raw: str | None = None
             try:
-                raw = await self._run_prompt(prompt)
+                raw, usage = await self._run_prompt_with_usage(prompt)
+                if usage is not None:
+                    self.last_input_tokens = usage.get("input_tokens")
+                    self.last_output_tokens = usage.get("output_tokens")
+                    self.last_cached_input_tokens = usage.get("cached_input_tokens")
                 last_stdout = raw
                 payload = extract_json_payload(raw)
                 plan = AnalysisPlan.model_validate(payload)
@@ -402,8 +421,10 @@ class LegacyCodexProvider:
                     "codex_revise_call",
                     {
                         "prompt": prompt,
+                        "skill_hints": self.last_skill_hints,
                         "raw_output": raw,
                         "parsed_result": payload,
+                        "usage": usage or {},
                         "parse_success": True,
                     },
                 )
@@ -416,6 +437,7 @@ class LegacyCodexProvider:
                     "plan",
                     "codex_revise",
                     {
+                        "skill_hints": self.last_skill_hints,
                         "parse_success": False,
                         "error": _format_exception_for_logs(exc),
                     },
@@ -496,7 +518,7 @@ class LegacyCodexProvider:
                 )
             try:
                 return await self._run_prompt_async_subprocess(argv, prompt)
-            except NotImplementedError:
+            except (NotImplementedError, PermissionError):
                 return await asyncio.to_thread(
                     _run_codex_subprocess_sync, argv, prompt, self.timeout_seconds
                 )
@@ -506,7 +528,21 @@ class LegacyCodexProvider:
     async def _run_prompt_with_usage(
         self, prompt: str
     ) -> tuple[str, dict[str, int] | None]:
-        """Run ``codex exec --json`` and return (reply, usage tokens)."""
+        """Run ``codex exec`` and return (reply, usage tokens).
+
+        By default we use ``--json`` so we can extract usage counters reliably.
+        Some environments (notably Windows wrappers or very verbose JSONL event
+        streams) can be unstable; set ``CODEX_USE_JSON_EVENTS=false`` to fall
+        back to non-JSON execution (usage will be ``None``).
+        """
+        use_json = os.getenv("CODEX_USE_JSON_EVENTS", "true").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if not use_json:
+            reply = await self._run_prompt(prompt)
+            return reply, None
         with tempfile.NamedTemporaryFile(
             delete=False, prefix="codex-last-", suffix=".txt"
         ) as f:
@@ -642,7 +678,7 @@ class LegacyCodexProvider:
                     stderr_text = (stderr_bytes or b"").decode(
                         "utf-8", errors="ignore"
                     ).strip()
-                except NotImplementedError:
+                except (NotImplementedError, PermissionError):
                     try:
                         completed = await asyncio.to_thread(
                             subprocess.run,
@@ -668,6 +704,31 @@ class LegacyCodexProvider:
                         completed.returncode if completed.returncode is not None else 0
                     )
             self.last_exec_elapsed_s = time.perf_counter() - started
+            # Optional: persist the JSONL event stream to disk for debugging/eval.
+            # The eval runner can set CODEX_JSONL_OUT_DIR and CODEX_JSONL_TAG
+            # (e.g., "<case_id>__<mode>") to save each run.
+            jsonl_dir = os.getenv("CODEX_JSONL_OUT_DIR", "").strip()
+            jsonl_tag = os.getenv("CODEX_JSONL_TAG", "").strip()
+            fix_jsonl_utf8 = os.getenv(
+                "CODEX_JSONL_FIX_UTF8", "true"
+            ).strip().lower() in ("1", "true", "yes")
+            jsonl_repo_root = Path(
+                os.getenv("CODEX_JSONL_REPO_ROOT", os.getcwd())
+            ).resolve()
+            if jsonl_dir and stdout_text.strip():
+                try:
+                    out_dir = Path(jsonl_dir)
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    name = jsonl_tag or f"codex_exec_{int(time.time())}"
+                    payload = stdout_text.rstrip() + "\n"
+                    if fix_jsonl_utf8:
+                        payload = repair_jsonl_text(payload, repo_root=jsonl_repo_root)
+                    (out_dir / f"{name}.jsonl").write_text(
+                        payload, encoding="utf-8", errors="replace"
+                    )
+                except Exception:
+                    # Best-effort only; do not fail the request due to logging.
+                    pass
             if first_event_at is not None:
                 self.last_spawn_elapsed_s = max(0.0, first_event_at - started)
             if first_agent_at is not None:

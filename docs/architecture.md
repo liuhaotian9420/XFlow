@@ -39,7 +39,8 @@ Compatibility hook:
 ## Skills
 
 - Skill registry scans `.agents/skills/*/SKILL.md`
-- Skill text is injected into prompts for planner/chat/reviser
+- Runtime relies on Codex native skills discovery/progressive disclosure
+- Prompts pass short explicit hints only (for example, `$analysis-planner`) and avoid full skill-body injection
 - Metadata endpoint: `GET /skills`
 
 ## Request Lifecycles

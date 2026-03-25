@@ -3,21 +3,52 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import time
 import uuid
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
+
+from app.sql_generator_jsonl_panel import render_sql_generator_jsonl_panel
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+
+# Shown when the transcript is empty (excluded from /chat history). Keep in sync with page caption.
+WELCOME_MESSAGE_MARKDOWN = (
+    "**Hi — here is how to get started:**\n\n"
+    "- **Chat**: ask questions about your data in normal language.\n"
+    "- **Structured run**: type **`/task`** plus your analysis question to get a plan, review or revise it, "
+    "then confirm to run.\n"
+    "- **Data file**: attach **CSV / Excel** with the **paperclip** in the chat bar (or manage it in the sidebar).\n"
+    "- **Mock Codex**: toggle in the sidebar for offline/built-in behavior vs real CLI.\n\n"
+    "When you are ready, type a message or **`/task`** below."
+)
+
+# ``type: "error"`` message ``kind`` (optional); not shown to the model.
+ERROR_KIND_CHAT = "chat"
+ERROR_KIND_CREATE_TASK = "create_task"
+ERROR_KIND_CONFIRM_TASK = "confirm_task"
+ERROR_KIND_REVISE_PLAN = "revise_plan"
+
+# Max user "turns" (each user text message starts one) fully expanded in the main column; older rows go in an expander.
+MAX_VISIBLE_CHAT_TURNS = 40
 
 st.set_page_config(page_title="xyf-competition-mvp", layout="wide")
 st.title("xyf-competition-mvp")
 st.caption(
     "Default: **chat** with the assistant about your data. Type **`/task`** + your question to generate a "
-    "structured plan, review or revise it, confirm to run, then mark the task complete."
+    "structured plan, review or revise it, confirm to run, then mark the task complete. "
+    "Use the **SQL generator · Codex JSONL** tab to run the local JSONL smoke test without the CLI."
 )
 
 
@@ -42,6 +73,49 @@ def _init_state() -> None:
     st.session_state.setdefault("show_prompt_debug", False)
     if "use_codex_mock" not in st.session_state:
         st.session_state.use_codex_mock = _default_use_codex_mock()
+
+
+def _ensure_welcome_if_empty() -> None:
+    """If there is no transcript yet, show one assistant welcome card (not sent as /chat history)."""
+    if st.session_state.messages:
+        return
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "type": "welcome",
+            "content": WELCOME_MESSAGE_MARKDOWN,
+        }
+    ]
+
+
+def _assistant_error_dict(
+    title: str,
+    detail: str,
+    kind: str | None = None,
+) -> dict[str, Any]:
+    """Build a chat bubble that renders with ``st.error`` + optional detail expander."""
+    msg: dict[str, Any] = {
+        "role": "assistant",
+        "type": "error",
+        "title": (title or "Error").strip() or "Error",
+        "detail": (detail or "").strip(),
+    }
+    if kind:
+        msg["kind"] = kind
+    return msg
+
+
+def _render_assistant_error_message(msg: dict[str, Any], msg_index: int) -> None:
+    """Render ``type: "error"`` with a callout and full text under Details."""
+    title = str(msg.get("title") or "Something went wrong")
+    detail = str(msg.get("detail") or "").strip()
+    kind = msg.get("kind")
+    st.error(f"**{title}**")
+    if isinstance(kind, str) and kind.strip():
+        st.caption(f"`kind:` {kind.strip()}")
+    if detail:
+        with st.expander("Details", key=f"assistant_err_details_{msg_index}"):
+            st.code(detail, language="text")
 
 
 def _invalidate_schema_cache() -> None:
@@ -119,6 +193,8 @@ def _chat_history_upto(before_index: int) -> list[dict[str, str]]:
         role = msg.get("role", "user")
         mtype = msg.get("type", "text")
         if role not in ("user", "assistant"):
+            continue
+        if mtype in ("welcome", "error"):
             continue
         if mtype == "text":
             content = (msg.get("content") or "").strip()
@@ -198,10 +274,13 @@ def _post_task_bytes(
 
 
 def _post_review(task_id: str, final_plan: dict[str, Any]) -> dict[str, Any]:
+    params = _codex_mock_query_params()
+    if bool(st.session_state.get("include_demo_artifacts", False)):
+        params["include_demo_artifacts"] = "true"
     response = requests.post(
         _api_url(f"/tasks/{task_id}/review"),
         json={"final_plan": final_plan},
-        params=_codex_mock_query_params(),
+        params=params,
         timeout=120,
     )
     response.raise_for_status()
@@ -360,6 +439,37 @@ def _render_result_block(result: dict[str, Any], task_id: str, key_suffix: str) 
         st.caption(result["execution_summary"])
     if result.get("summary"):
         st.markdown(result["summary"])
+
+    artifacts = result.get("artifacts") or []
+    if artifacts:
+        st.markdown("**Artifacts**")
+        for idx, a in enumerate(artifacts):
+            name = str(a.get("name") or f"artifact_{idx}")
+            mime = str(a.get("mime") or "")
+            width = a.get("display_width")
+            height = a.get("display_height")
+            if isinstance(width, int) and width > 0:
+                width = min(width, 800)
+            else:
+                width = 640
+            if mime.startswith("image/"):
+                b64 = a.get("data_base64")
+                if isinstance(b64, str) and b64.strip():
+                    import base64 as _b64
+
+                    raw = _b64.b64decode(b64)
+                    st.image(raw, caption=name, width=width)
+                else:
+                    st.warning(f"Image artifact `{name}` missing data.")
+            elif mime == "text/html":
+                html = a.get("html")
+                if isinstance(html, str) and html.strip():
+                    h = height if isinstance(height, int) and height > 0 else 180
+                    components.html(html, height=h, scrolling=True)
+                else:
+                    st.warning(f"HTML artifact `{name}` missing html.")
+            else:
+                st.caption(f"{name} ({mime})")
     follow = result.get("follow_ups") or []
     if follow:
         st.markdown("**Suggested follow-ups**")
@@ -399,11 +509,11 @@ def _restore_chat_messages_from_turns(turns: list[dict[str, Any]]) -> list[dict[
         error_text = str(turn.get("error_text") or "").strip()
         if error_text and not reply_text:
             restored.append(
-                {
-                    "role": "assistant",
-                    "type": "text",
-                    "content": f"**Chat failed:** {error_text}",
-                }
+                _assistant_error_dict(
+                    "Chat failed",
+                    error_text,
+                    kind=ERROR_KIND_CHAT,
+                )
             )
     return restored
 
@@ -494,11 +604,11 @@ def _execute_create_task(msg: dict[str, Any], msg_index: int) -> None:
                 "or fix the CLI / auth / network issue above and retry."
             )
         )
-        st.session_state.messages[msg_index] = {
-            "role": "assistant",
-            "type": "text",
-            "content": f"**Could not create task.** The server said:\n\n{detail}{hint}",
-        }
+        st.session_state.messages[msg_index] = _assistant_error_dict(
+            "Could not create task",
+            f"The server said:\n\n{detail}{hint}",
+            kind=ERROR_KIND_CREATE_TASK,
+        )
     st.rerun()
 
 
@@ -532,11 +642,11 @@ def _execute_confirm_task(msg: dict[str, Any], msg_index: int) -> None:
                 "content": f"Review submitted but no result on record (status={rec.get('status')}).",
             }
     except requests.RequestException as exc:
-        st.session_state.messages[msg_index] = {
-            "role": "assistant",
-            "type": "text",
-            "content": f"**Execution failed:** {_requests_error_message(exc)}",
-        }
+        st.session_state.messages[msg_index] = _assistant_error_dict(
+            "Execution failed",
+            _requests_error_message(exc),
+            kind=ERROR_KIND_CONFIRM_TASK,
+        )
     st.rerun()
 
 
@@ -569,6 +679,8 @@ def _execute_chat_reply(msg: dict[str, Any], msg_index: int) -> None:
         cached_input_tokens = resp.get("cached_input_tokens")
         api_elapsed = resp.get("api_elapsed_s")
         client_elapsed = resp.get("_client_elapsed_s")
+        runtime_vendor = str(resp.get("runtime_vendor") or "").strip()
+        runtime_binary = str(resp.get("runtime_binary") or "").strip()
         timing_parts: list[str] = []
         if isinstance(codex_elapsed, (int, float)):
             timing_parts.append(f"codex执行 {codex_elapsed:.2f}s")
@@ -616,6 +728,11 @@ def _execute_chat_reply(msg: dict[str, Any], msg_index: int) -> None:
             token_parts.append(f"cached_in {cached_input_tokens}")
         if token_parts:
             reply = f"{reply}\n\n`[Tokens] {' | '.join(token_parts)}`"
+        if runtime_vendor:
+            runtime_text = f"[Runtime] {runtime_vendor}"
+            if runtime_binary:
+                runtime_text = f"{runtime_text} | {runtime_binary}"
+            reply = f"{reply}\n\n`{runtime_text}`"
         st.session_state.messages[msg_index] = {
             "role": "assistant",
             "type": "chat_response",
@@ -625,11 +742,11 @@ def _execute_chat_reply(msg: dict[str, Any], msg_index: int) -> None:
             "history_turns_used": history_turns_used,
         }
     except requests.RequestException as exc:
-        st.session_state.messages[msg_index] = {
-            "role": "assistant",
-            "type": "text",
-            "content": f"**Chat failed:** {_requests_error_message(exc)}",
-        }
+        st.session_state.messages[msg_index] = _assistant_error_dict(
+            "Chat failed",
+            _requests_error_message(exc),
+            kind=ERROR_KIND_CHAT,
+        )
     st.rerun()
 
 
@@ -641,7 +758,10 @@ def _execute_revise_plan(msg: dict[str, Any], msg_index: int) -> None:
         with st.spinner("Revising plan…"):
             resp = _post_revise(task_id, instruction)
         plan = resp["plan"]
-        st.session_state.pop(f"plan_json_{task_id}", None)
+        suffix = f"_{task_id}"
+        for k in list(st.session_state.keys()):
+            if isinstance(k, str) and k.startswith("plan_json_") and k.endswith(suffix):
+                st.session_state.pop(k, None)
         for j, m in enumerate(st.session_state.messages):
             if m.get("type") == "plan_review" and m.get("task_id") == task_id:
                 st.session_state.messages[j] = {
@@ -657,12 +777,208 @@ def _execute_revise_plan(msg: dict[str, Any], msg_index: int) -> None:
             "content": "Plan updated from your feedback — review the card above, or describe more changes.",
         }
     except requests.RequestException as exc:
-        st.session_state.messages[msg_index] = {
-            "role": "assistant",
-            "type": "text",
-            "content": f"**Could not revise plan:** {_requests_error_message(exc)}",
-        }
+        st.session_state.messages[msg_index] = _assistant_error_dict(
+            "Could not revise plan",
+            _requests_error_message(exc),
+            kind=ERROR_KIND_REVISE_PLAN,
+        )
     st.rerun()
+
+
+def _format_ts_for_sidebar(iso: str | None) -> str:
+    """Format API ISO timestamps for a weak sidebar caption: output MM-DD HH:MM (local time when tz-aware)."""
+    if iso is None or not str(iso).strip():
+        return "—"
+    s = str(iso).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return s[:16] if len(s) >= 16 else s
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime("%m-%d %H:%M")
+
+
+def _user_text_message_indices(messages: list[dict[str, Any]]) -> list[int]:
+    return [
+        i
+        for i, m in enumerate(messages)
+        if m.get("role") == "user" and m.get("type") == "text"
+    ]
+
+
+def _transcript_cut_for_viewport(
+    messages: list[dict[str, Any]],
+    max_turns: int,
+) -> int:
+    """First index of the suffix shown outside the \"older\" expander; ``0`` means show everything."""
+    user_idxs = _user_text_message_indices(messages)
+    if len(user_idxs) <= max_turns:
+        return 0
+    return int(user_idxs[-max_turns])
+
+
+def _render_chat_message(i: int, msg: dict[str, Any]) -> None:
+    """Render one transcript row; ``i`` is the index in ``st.session_state.messages`` (required for thinking + unique keys)."""
+    role = msg.get("role", "assistant")
+    mtype = msg.get("type", "text")
+
+    if mtype == "thinking":
+        action = msg.get("action")
+        with st.chat_message("assistant"):
+            if action == "create_task":
+                st.markdown("Analyzing your question…")
+                _execute_create_task(msg, i)
+            elif action == "confirm_task":
+                st.markdown("Running the analysis plan…")
+                _execute_confirm_task(msg, i)
+            elif action == "chat_reply":
+                st.markdown("Thinking…")
+                _execute_chat_reply(msg, i)
+            elif action == "revise_plan":
+                st.markdown("Updating the plan…")
+                _execute_revise_plan(msg, i)
+            else:
+                st.markdown("Processing…")
+        return
+
+    with st.chat_message(role):
+        if mtype == "welcome":
+            st.markdown(msg.get("content", ""))
+        elif mtype == "error":
+            _render_assistant_error_message(msg, i)
+        elif mtype == "text":
+            st.markdown(msg.get("content", ""))
+        elif mtype == "chat_response":
+            st.markdown(msg.get("content", ""))
+            debug_prompt = msg.get("debug_prompt")
+            if isinstance(debug_prompt, str) and debug_prompt.strip():
+                with st.expander("Context sent to Codex", key=f"ctx_codex_{i}"):
+                    pchars = msg.get("prompt_chars")
+                    hturns = msg.get("history_turns_used")
+                    meta_parts: list[str] = []
+                    if isinstance(pchars, int):
+                        meta_parts.append(f"prompt_chars={pchars}")
+                    if isinstance(hturns, int):
+                        meta_parts.append(f"history_turns={hturns}")
+                    if meta_parts:
+                        st.caption(" | ".join(meta_parts))
+                    st.code(debug_prompt, language="markdown")
+        elif mtype == "plan_review":
+            task_id = msg["task_id"]
+            plan = msg["plan"]
+            st.markdown(
+                "Here is the proposed **analysis plan**. Review the JSON if needed, then confirm to run. "
+                "While this card is open, you can **type revision feedback in chat** (no `/task` prefix) to update the plan."
+            )
+            _render_plan_tables(plan)
+
+            conf = plan.get("confidence")
+            if conf is not None:
+                if conf < 0.6:
+                    st.warning(f"Low confidence: **{conf:.2f}** — check filters and columns.")
+                else:
+                    st.info(f"Confidence: **{conf:.2f}**")
+
+            for amb in plan.get("ambiguities") or []:
+                st.warning(f"`{amb.get('field', '?')}`: {amb.get('issue', '')}")
+
+            plan_key = f"plan_json_{i}_{task_id}"
+            if plan_key not in st.session_state:
+                st.session_state[plan_key] = json.dumps(plan, ensure_ascii=False, indent=2)
+
+            with st.expander("Raw plan JSON (advanced)", key=f"raw_plan_exp_{i}_{task_id}"):
+                st.text_area(
+                    "Edit plan JSON",
+                    key=plan_key,
+                    height=260,
+                    label_visibility="collapsed",
+                )
+
+            done_key = f"review_done_{task_id}"
+            if st.session_state.get(done_key):
+                st.success("Plan submitted — scroll down for the result card.")
+            else:
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button(
+                        "Confirm and run",
+                        type="primary",
+                        key=f"confirm_{i}_{task_id}",
+                    ):
+                        try:
+                            final_plan = json.loads(st.session_state[plan_key])
+                        except json.JSONDecodeError as exc:
+                            st.error(str(exc))
+                        else:
+                            st.session_state.messages.append(
+                                {
+                                    "role": "assistant",
+                                    "type": "thinking",
+                                    "action": "confirm_task",
+                                    "task_id": task_id,
+                                    "final_plan": final_plan,
+                                }
+                            )
+                            st.rerun()
+                with b2:
+                    st.caption("Edit the JSON in the expander above before confirming.")
+
+        elif mtype == "result":
+            tid = msg["task_id"]
+            st.markdown("**Results**")
+            _render_result_block(msg["result"], tid, key_suffix=f"{i}_{tid[:8]}")
+        elif mtype == "task_done_confirm":
+            tid = msg["task_id"]
+            st.markdown("**Task finished** — does this meet your goal?")
+            note_key = f"replan_note_{i}_{tid}"
+            st.text_area(
+                "If not, describe what is missing (optional)",
+                key=note_key,
+                height=72,
+            )
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("Mark complete", type="primary", key=f"done_ok_{i}_{tid}"):
+                    st.session_state.mode = "chat"
+                    st.session_state.active_task_id = None
+                    st.session_state.messages[i] = {
+                        "role": "assistant",
+                        "type": "text",
+                        "content": (
+                            "Marked complete. You can keep chatting, or start a structured run with **`/task`** "
+                            "+ your question."
+                        ),
+                    }
+                    st.rerun()
+            with b2:
+                if st.button("Not done — replan", key=f"done_replan_{i}_{tid}"):
+                    note = (st.session_state.get(note_key) or "").strip() or "Needs a different analysis."
+                    try:
+                        rec = _get_task(tid)
+                        orig_q = (rec.get("input") or {}).get("question", "")
+                    except requests.RequestException:
+                        orig_q = ""
+                    combined = (
+                        f"{orig_q}\n\nUser feedback (result not sufficient): {note}"
+                        if orig_q
+                        else f"User feedback (result not sufficient): {note}"
+                    )
+                    st.session_state.mode = "task"
+                    st.session_state.messages[i] = {
+                        "role": "assistant",
+                        "type": "text",
+                        "content": "Generating a new plan from your feedback…",
+                    }
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "type": "thinking",
+                            "action": "create_task",
+                            "question": combined.strip(),
+                        }
+                    )
+                    st.rerun()
 
 
 _init_state()
@@ -694,13 +1010,21 @@ with st.sidebar:
 
     st.toggle(
         "Mock Codex (no CLI)",
+        value = False,
         key="use_codex_mock",
         help="When off, the API uses the real Codex CLI for plan / summary / follow-ups (same as CODEX_MOCK=false).",
     )
     st.toggle(
         "Show Prompt Debug",
+        value = False,
         key="show_prompt_debug",
         help="Show a collapsed panel under each chat response with the exact prompt sent to Codex.",
+    )
+    st.toggle(
+        "Include demo artifacts (PNG + HTML)",
+        value=False,
+        key="include_demo_artifacts",
+        help="Attach a demo image (downloaded from the internet) + a demo HTML snippet in task results to test rendering.",
     )
     st.text_input(
         "Model Override",
@@ -745,10 +1069,19 @@ with st.sidebar:
         for item in st.session_state.chat_sessions_cache:
             sid = str(item.get("session_id") or "")
             turn_count = int(item.get("turn_count") or 0)
-            st.caption(f"`{sid[:8]}…` · {turn_count} turns")
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Load", key=f"load_chat_session_{sid}"):
+            col_label, col_load, col_del = st.columns([3, 1, 1])
+            with col_label:
+                created = _format_ts_for_sidebar(item.get("created_at"))
+                updated = _format_ts_for_sidebar(item.get("updated_at"))
+                st.caption(f"`{sid[:8]}…` · {turn_count} turns · 最后更新 {updated}")
+            with col_load:
+                if st.button(
+                    "Load",
+                    key=f"load_chat_session_{sid}",
+                    type="primary",
+                    use_container_width=True,
+                    help="Restore this server session into the chat area",
+                ):
                     try:
                         turns = _get_chat_session_turns(sid, limit=200)
                         st.session_state.messages = _restore_chat_messages_from_turns(turns)
@@ -757,8 +1090,14 @@ with st.sidebar:
                         st.rerun()
                     except requests.RequestException as exc:
                         st.error(_requests_error_message(exc))
-            with c2:
-                if st.button("Delete", key=f"delete_chat_session_{sid}"):
+            with col_del:
+                if st.button(
+                    "Delete",
+                    key=f"delete_chat_session_{sid}",
+                    type="tertiary",
+                    width='content',
+                    help="Remove this session from the server",
+                ):
                     try:
                         _delete_chat_session(sid)
                         if st.session_state.get("chat_session_id") == sid:
@@ -834,229 +1173,105 @@ with st.sidebar:
         st.session_state.chat_session_id = str(uuid.uuid4())
         st.rerun()
 
-# --- Process follow-up click (before rendering chat) ---
-if st.session_state.get("_followup_q"):
-    fq = st.session_state._followup_q
-    st.session_state._followup_q = None
-    st.session_state.messages.append({"role": "user", "type": "text", "content": fq})
-    st.session_state.mode = "task"
-    _enqueue_task(fq)
-    st.rerun()
+tab_chat, tab_sql_jsonl = st.tabs(["Chat & tasks", "SQL generator · Codex JSONL"])
 
-# --- Render chat ---
-for i, msg in enumerate(st.session_state.messages):
-    role = msg.get("role", "assistant")
-    mtype = msg.get("type", "text")
+with tab_chat:
+    # --- Process follow-up click (before rendering chat) ---
+    if st.session_state.get("_followup_q"):
+        fq = st.session_state._followup_q
+        st.session_state._followup_q = None
+        st.session_state.messages.append({"role": "user", "type": "text", "content": fq})
+        st.session_state.mode = "task"
+        _enqueue_task(fq)
+        st.rerun()
 
-    # --- Deferred execution: "thinking" placeholders trigger API calls during render ---
-    if mtype == "thinking":
-        action = msg.get("action")
-        with st.chat_message("assistant"):
-            if action == "create_task":
-                st.markdown("Analyzing your question…")
-                _execute_create_task(msg, i)
-            elif action == "confirm_task":
-                st.markdown("Running the analysis plan…")
-                _execute_confirm_task(msg, i)
-            elif action == "chat_reply":
-                st.markdown("Thinking…")
-                _execute_chat_reply(msg, i)
-            elif action == "revise_plan":
-                st.markdown("Updating the plan…")
-                _execute_revise_plan(msg, i)
-            else:
-                st.markdown("Processing…")
-        continue
+    _ensure_welcome_if_empty()
 
-    with st.chat_message(role):
-        if mtype == "text":
-            st.markdown(msg.get("content", ""))
-        elif mtype == "chat_response":
-            st.markdown(msg.get("content", ""))
-            debug_prompt = msg.get("debug_prompt")
-            if isinstance(debug_prompt, str) and debug_prompt.strip():
-                with st.expander("Context sent to Codex"):
-                    pchars = msg.get("prompt_chars")
-                    hturns = msg.get("history_turns_used")
-                    meta_parts: list[str] = []
-                    if isinstance(pchars, int):
-                        meta_parts.append(f"prompt_chars={pchars}")
-                    if isinstance(hturns, int):
-                        meta_parts.append(f"history_turns={hturns}")
-                    if meta_parts:
-                        st.caption(" | ".join(meta_parts))
-                    st.code(debug_prompt, language="markdown")
-        elif mtype == "plan_review":
-            task_id = msg["task_id"]
-            plan = msg["plan"]
-            st.markdown(
-                "Here is the proposed **analysis plan**. Review the JSON if needed, then confirm to run. "
-                "While this card is open, you can **type revision feedback in chat** (no `/task` prefix) to update the plan."
+    # --- Render chat (40 user-turn viewport; older rows in expander) ---
+    _messages = st.session_state.messages
+    _cut = _transcript_cut_for_viewport(_messages, MAX_VISIBLE_CHAT_TURNS)
+    _pin_welcome = (
+        _cut > 0
+        and bool(_messages)
+        and _messages[0].get("type") == "welcome"
+    )
+    _exp_lo = 1 if _pin_welcome else 0
+    _exp_hi = _cut
+
+    if _pin_welcome:
+        _render_chat_message(0, _messages[0])
+
+    if _exp_lo < _exp_hi:
+        _n_hidden = _exp_hi - _exp_lo
+        with st.expander(f"加载更早的对话（{_n_hidden} 条消息）", key="viewport_older_messages"):
+            for _j in range(_exp_lo, _exp_hi):
+                _render_chat_message(_j, _messages[_j])
+
+    for _i in range(_cut, len(_messages)):
+        _render_chat_message(_i, _messages[_i])
+
+    # --- Chat input (CSV/Excel via paperclip) ---
+    chat_val = st.chat_input(
+        "Chat freely, or type /task + your analysis question — attach CSV/Excel via paperclip…",
+        accept_file=True,
+        file_type=["csv", "xlsx", "xls"],
+        key="chat_prompt",
+    )
+    if chat_val is not None:
+        text = chat_val.text.strip() if not isinstance(chat_val, str) else chat_val.strip()
+        file_list = [] if isinstance(chat_val, str) else list(chat_val.files)
+        if file_list:
+            f0 = file_list[0]
+            prev_name = (st.session_state.file_meta or {}).get("name")
+            st.session_state.file_meta = {
+                "name": f0.name,
+                "type": f0.type or "application/octet-stream",
+                "data": f0.getvalue(),
+            }
+            if prev_name != f0.name:
+                _invalidate_schema_cache()
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "type": "text",
+                    "content": f"Loaded **`{f0.name}`**.",
+                }
             )
-            _render_plan_tables(plan)
-
-            conf = plan.get("confidence")
-            if conf is not None:
-                if conf < 0.6:
-                    st.warning(f"Low confidence: **{conf:.2f}** — check filters and columns.")
-                else:
-                    st.info(f"Confidence: **{conf:.2f}**")
-
-            for amb in plan.get("ambiguities") or []:
-                st.warning(f"`{amb.get('field', '?')}`: {amb.get('issue', '')}")
-
-            plan_key = f"plan_json_{task_id}"
-            if plan_key not in st.session_state:
-                st.session_state[plan_key] = json.dumps(plan, ensure_ascii=False, indent=2)
-
-            with st.expander("Raw plan JSON (advanced)"):
-                st.text_area(
-                    "Edit plan JSON",
-                    key=plan_key,
-                    height=260,
-                    label_visibility="collapsed",
-                )
-
-            done_key = f"review_done_{task_id}"
-            if st.session_state.get(done_key):
-                st.success("Plan submitted — scroll down for the result card.")
-            else:
-                b1, b2 = st.columns(2)
-                with b1:
-                    if st.button("Confirm and run", type="primary", key=f"confirm_{task_id}"):
-                        try:
-                            final_plan = json.loads(st.session_state[plan_key])
-                        except json.JSONDecodeError as exc:
-                            st.error(str(exc))
-                        else:
-                            st.session_state.messages.append(
-                                {
-                                    "role": "assistant",
-                                    "type": "thinking",
-                                    "action": "confirm_task",
-                                    "task_id": task_id,
-                                    "final_plan": final_plan,
-                                }
-                            )
-                            st.rerun()
-                with b2:
-                    st.caption("Edit the JSON in the expander above before confirming.")
-
-        elif mtype == "result":
-            tid = msg["task_id"]
-            st.markdown("**Results**")
-            _render_result_block(msg["result"], tid, key_suffix=f"{i}_{tid[:8]}")
-        elif mtype == "task_done_confirm":
-            tid = msg["task_id"]
-            st.markdown("**Task finished** — does this meet your goal?")
-            note_key = f"replan_note_{tid}"
-            st.text_area(
-                "If not, describe what is missing (optional)",
-                key=note_key,
-                height=72,
-            )
-            b1, b2 = st.columns(2)
-            with b1:
-                if st.button("Mark complete", type="primary", key=f"done_ok_{tid}"):
-                    st.session_state.mode = "chat"
-                    st.session_state.active_task_id = None
-                    st.session_state.messages[i] = {
-                        "role": "assistant",
-                        "type": "text",
-                        "content": (
-                            "Marked complete. You can keep chatting, or start a structured run with **`/task`** "
-                            "+ your question."
-                        ),
-                    }
-                    st.rerun()
-            with b2:
-                if st.button("Not done — replan", key=f"done_replan_{tid}"):
-                    note = (st.session_state.get(note_key) or "").strip() or "Needs a different analysis."
-                    try:
-                        rec = _get_task(tid)
-                        orig_q = (rec.get("input") or {}).get("question", "")
-                    except requests.RequestException:
-                        orig_q = ""
-                    combined = (
-                        f"{orig_q}\n\nUser feedback (result not sufficient): {note}"
-                        if orig_q
-                        else f"User feedback (result not sufficient): {note}"
-                    )
-                    st.session_state.mode = "task"
-                    st.session_state.messages[i] = {
-                        "role": "assistant",
-                        "type": "text",
-                        "content": "Generating a new plan from your feedback…",
-                    }
+        if text:
+            st.session_state.messages.append({"role": "user", "type": "text", "content": text})
+            is_task_cmd, task_body = _parse_task_command(text)
+            if is_task_cmd:
+                if not task_body:
                     st.session_state.messages.append(
                         {
                             "role": "assistant",
-                            "type": "thinking",
-                            "action": "create_task",
-                            "question": combined.strip(),
+                            "type": "text",
+                            "content": "Use **`/task`** followed by your analysis request (e.g. `/task compare sales by region`).",
                         }
                     )
-                    st.rerun()
-
-# --- Chat input (CSV/Excel via paperclip) ---
-chat_val = st.chat_input(
-    "Chat freely, or type /task + your analysis question — attach CSV/Excel via paperclip…",
-    accept_file=True,
-    file_type=["csv", "xlsx", "xls"],
-    key="chat_prompt",
-)
-if chat_val is not None:
-    text = chat_val.text.strip() if not isinstance(chat_val, str) else chat_val.strip()
-    file_list = [] if isinstance(chat_val, str) else list(chat_val.files)
-    if file_list:
-        f0 = file_list[0]
-        prev_name = (st.session_state.file_meta or {}).get("name")
-        st.session_state.file_meta = {
-            "name": f0.name,
-            "type": f0.type or "application/octet-stream",
-            "data": f0.getvalue(),
-        }
-        if prev_name != f0.name:
-            _invalidate_schema_cache()
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "type": "text",
-                "content": f"Loaded **`{f0.name}`**.",
-            }
-        )
-    if text:
-        st.session_state.messages.append({"role": "user", "type": "text", "content": text})
-        is_task_cmd, task_body = _parse_task_command(text)
-        if is_task_cmd:
-            if not task_body:
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "type": "text",
-                        "content": "Use **`/task`** followed by your analysis request (e.g. `/task compare sales by region`).",
-                    }
-                )
-            else:
-                st.session_state.mode = "task"
-                _enqueue_task(task_body)
-        elif st.session_state.get("mode") == "task":
-            pending_tid = _pending_plan_task_id()
-            if pending_tid is not None:
-                _enqueue_revise_plan(pending_tid, text)
+                else:
+                    st.session_state.mode = "task"
+                    _enqueue_task(task_body)
+            elif st.session_state.get("mode") == "task":
+                pending_tid = _pending_plan_task_id()
+                if pending_tid is not None:
+                    _enqueue_revise_plan(pending_tid, text)
+                else:
+                    st.session_state.mode = "chat"
+                    _enqueue_chat(text)
             else:
                 st.session_state.mode = "chat"
                 _enqueue_chat(text)
-        else:
-            st.session_state.mode = "chat"
-            _enqueue_chat(text)
-    elif file_list and not text:
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "type": "text",
-                "content": "File ready. Ask a question in the chat box.",
-            }
-        )
-    st.rerun()
+        elif file_list and not text:
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "type": "text",
+                    "content": "File ready. Ask a question in the chat box.",
+                }
+            )
+        st.rerun()
+
+with tab_sql_jsonl:
+    render_sql_generator_jsonl_panel()
 

@@ -1,0 +1,725 @@
+--@exclude_input=xyf_dwd.dwd_user_vip_order_df
+--@exclude_input=xyf_dwd.dwd_inloan_loan_apply_hf
+--@exclude_input=xyf_dwd.dwd_inloan_leap_vip_order_hf
+--@exclude_input=xyf_jingying.fy_history_risk_price_modify
+--@exclude_input=xyf_jingying.weekly_analysis_report_vip_income_lss
+--@exclude_input=xyf_jingying.weekly_analysis_report_df_lss
+DROP TABLE IF EXISTS xyf_jingying.weekly_analysis_report_df_lss;
+CREATE TABLE xyf_jingying.weekly_analysis_report_df_lss AS
+
+SELECT  
+        a.original_order_no
+       ,a.order_number
+       ,a.user_no
+       ,a.first_order_number
+	   ,a.split_rn 
+	   ,CASE WHEN a.app = 'xyf01' AND a.business_line IN ('APP', '小程序端') AND a.loan_flag = '首贷' THEN 'APP首贷' 
+	   		 WHEN a.app IN ('xyf01', 'fxk') AND a.business_line IN ('APP', '小程序端') AND a.loan_flag IN ('复贷', '加贷') THEN 'APP复贷' 
+			 WHEN a.app = 'xyf01'AND a.business_line = 'API'  THEN 'API首复贷' ELSE '其他' 
+		END 																						     AS 业务线
+	   ,a.out_order_number 
+	   ,a.inner_app
+	   ,a.loan_flag
+       ,a.apply_order_time                                                                               AS 订单发起时间
+	   ,DATE(a.apply_order_time)                                                                         AS 订单发起日期
+       ,SUBSTR(a.apply_order_time,1,7)                                                                   AS 订单发起月
+       ,CONCAT(ow.day_week01_xf_new,'至',ow.day_weekend_xf_new)                                          AS 订单发起周
+       ,r.risk_success_time                                                                              AS 风险通过时间
+       ,a.loan_time                                                                                      AS 放款时间
+	   ,DATE(a.loan_time)                                                                                AS 放款日期
+       ,SUBSTR(a.loan_time,1,7)                                                                          AS 放款月
+       ,CONCAT(lw.day_week01_xf_new,'至',lw.day_weekend_xf_new)                                          AS 放款周
+	   ,a.order_amt
+       ,a.loan_amt                                                                                      
+       ,a.period                                                                                         AS 订单期限
+	   ,CASE WHEN op.ori_risk_price = 0.24 AND op2.ori_order_number IS NULL THEN 0.24 ELSE 0.36 END      AS 风险原始定价
+       ,a.asset_type_flag                                                                                AS 资产实际价格
+	   ,a.fee_rate
+	   ,rp.initial_interest_fee                                                                                       
+	   ,rl.risk_level                                                                                    AS 离线评级
+	   ,CASE WHEN fk_old.是否额外放开 = 1                                               -- 老客额外放开
+           	   OR xujia.授信是否虚假给额 = 1                                            -- APP首贷虚假给额（新客）
+               OR laohui.biz_flow_number IS NOT NULL                                    -- APP首贷会员卡捞回（新客）
+               OR (tp3.biz_flow_number IS NOT NULL AND tp4.biz_flow_number IS NOT NULL) -- API首贷额外放开（新客）
+        THEN 1 ELSE 0 END                                                       					     AS 是否额外放开
+--   资金通过时效性指标 
+       ,CASE WHEN (UNIX_TIMESTAMP(a.loan_time) - UNIX_TIMESTAMP(r.risk_success_time)) <= 2 * 3600 THEN 1  ELSE 0 END AS 2h内资金通过
+       ,CASE WHEN (UNIX_TIMESTAMP(a.loan_time) - UNIX_TIMESTAMP(r.risk_success_time)) <= 24 * 3600 THEN 1  ELSE 0 END AS 24h内资金通过
+       ,CASE WHEN (UNIX_TIMESTAMP(a.loan_time) - UNIX_TIMESTAMP(r.risk_success_time)) <= 72 * 3600 THEN 1  ELSE 0 END AS 72h内资金通过
+--   飞跃在会状态 
+       ,CASE WHEN fy.app_user_id IS NULL THEN '非在会'
+     		 --WHEN fy.renew_period = 0 AND a.first_order_number = fy.loan_order_number THEN '签约当笔'
+    	     --WHEN fy.renew_period = 0 AND a.first_order_number <> fy.loan_order_number THEN '签约期间发起'
+      		 --WHEN fy.renew_period > 0 THEN '续约期间发起'
+      		 ELSE '在会'  END                                                                             AS 飞跃在会     
+       ,CASE WHEN fy.pay_time IS NOT NULL AND DATE(a.first_order_time) >= DATE_ADD(DATE(fy.pay_time), 1) THEN 1 
+	   		 ELSE 0 END                                                                                   AS 飞跃在会已扣得
+	   ,fy.vip_flow_group
+--   飞享在会状态 
+       ,CASE WHEN fx.app_user_id IS NULL THEN '非在会' ELSE '在会' END 	                                  AS 飞享在会
+       ,CASE WHEN fx.pay_time IS NOT NULL AND DATE(a.first_order_time) >= DATE_ADD(DATE(fx.pay_time), 1) THEN 1 
+	         ELSE 0 END                                                                                   AS 飞享在会已扣得
+	   ,fy.vip_order_number AS fy_vip_order_number  
+	   ,fy.start_time       AS 飞跃会员卡开始时间
+	   ,fy.end_time         AS 飞跃会员卡结束时间
+	   ,fx.vip_order_number AS fx_vip_order_number
+	   ,fx.start_time       AS 飞享会员卡开始时间
+	   ,fx.end_time         AS 飞享会员卡结束时间
+FROM
+( --  基础放款数据(拆分订单关联detail表让形成非拆分订单一行记录，拆分订单多行子订单记录)
+SELECT  order_df.*
+       ,detail_df.*EXCEPT(original_order_no)
+       ,ROW_NUMBER() OVER ( PARTITION BY order_df.original_order_no 
+	   						ORDER BY detail_df.first_order_time ASC,COALESCE(detail_df.loan_time,'9999-12-31 00:00:00') ASC,detail_df.order_number ASC ) AS split_rn 
+	   -- 拆分时间、放款时间、订单号优先次序给拆分子订单排序
+FROM
+(
+	SELECT  first_order_number AS original_order_no
+	       ,first_order_time   AS apply_order_time --拆分订单和非拆分订单的初始申请时间
+	       ,order_amt                             --初始申请总金额
+	FROM xyf_dws.dws_inloan_user_order_df
+	WHERE pt = MAX_PT('xyf_dws.dws_inloan_user_order_df')
+	AND DATE(first_order_time) >= '2025-07-01' 
+) order_df
+LEFT JOIN
+(
+	SELECT  order_number
+	       ,user_no
+	       ,first_order_number -- 非拆分订单原始申请订单号、拆分订单拆分后的申请订单号
+	       ,first_order_time -- detail_df中该字段拆单订单为拆单时间
+	       ,out_order_number -- 外部进件订单号
+	       ,COALESCE(NULLIF(TRIM(original_order_no), ''),first_order_number) AS original_order_no --只有拆单订单有原始订单号这个字段, 非拆单订单也处理一下
+	       ,app
+	       ,inner_app
+	       ,business_line
+	       ,loan_flag
+	       ,loan_time
+	       ,loan_amt
+	       ,period
+	       ,asset_type_flag
+	       ,fee_rate
+	       ,biz_flow_number
+	FROM xyf_dws.dws_inloan_user_order_detail_df --最新的明细表
+	WHERE pt = MAX_PT('xyf_dws.dws_inloan_user_order_detail_df')
+	AND ori_loan_status <> '08'  --拆单前主订单的状态码值，剔除以匹配拆单后子订单的信息状态
+	AND DATE(first_order_time) >= '2025-07-01' 
+) detail_df
+ON order_df.original_order_no = detail_df.original_order_no
+) a
+-- 风险通过时间 
+LEFT JOIN
+(
+	SELECT DISTINCT ori_order_number   
+	       ,risk_success_time        --去重，只留一条包含风险通过时间的记录
+	FROM xyf_dwd.dwd_inloan_loan_apply_hf
+	WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_loan_apply_hf')
+	AND DATE(main_date_created) >= '2025-07-01' -- 预过滤 
+) r
+ON a.original_order_no = r.ori_order_number  -- loan_apply_hf仅有拆单前主订单记录有风险通过时间，因此用original_order_no关联
+-- 订单发起周
+LEFT JOIN
+(
+	SELECT  day_id_iso
+	       ,day_week01_xf_new
+	       ,day_weekend_xf_new
+	FROM xyf_dim.dim_pub_date
+	WHERE day_id_iso >= '2025-07-01' 
+) ow
+ON DATE(a.apply_order_time) = ow.day_id_iso
+-- 放款周
+LEFT JOIN
+(
+	SELECT  day_id_iso
+	       ,day_week01_xf_new
+	       ,day_weekend_xf_new
+	FROM xyf_dim.dim_pub_date
+	WHERE day_id_iso >= '2025-07-01' 
+) lw
+ON DATE(a.loan_time) = lw.day_id_iso
+-- 风险原始定价
+LEFT JOIN
+(
+	SELECT  ori_order_number
+		   ,ori_risk_price
+ 		 --,ori_risk_price_type
+	FROM xyf_dwd.dwd_inloan_loan_apply_main_df
+    WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_loan_apply_main_df')  --7月1号之后的订单才有风险原始定价
+	AND DATE(date_created) >= '2025-07-01'
+) op
+ON a.first_order_number = op.ori_order_number   -- 拆分后子订单可匹配上风险定价
+LEFT JOIN
+(
+	SELECT  ori_order_number
+	FROM xyf_jingying.fy_history_risk_price_modify --实际风险定价为36的订单记录（老客）
+) op2
+ON a.first_order_number =  op2.ori_order_number
+-- 仅能关联复贷离线评级
+LEFT JOIN
+(
+	SELECT  user_no
+		   ,mob_date
+		   ,risk_level  
+		   -- ,DATE(TO_DATE(pt,'yyyymmdd'))                                             AS pt_date
+	FROM xyf_ads.ads_feature_custno_app_customer_df
+    WHERE pt >= '20250630' 
+) rl
+ON a.user_no = rl.user_no AND DATE(a.apply_order_time) = rl.mob_date
+-- 飞跃在会状态 （新逻辑：基于会员卡有效期）
+LEFT JOIN
+(
+	SELECT  app_user_id
+		   ,vip_order_number
+		   --,first_vip_order_number
+		   ,order_time
+	       ,pay_time
+		   --,real_card_price
+		   --,act_refund_time
+		   --,refund_amount
+		   ,start_time
+		   ,coalesce(CAST(failure_time AS DATETIME),end_time) AS end_time   --飞跃合约期外退款，failure_time=end_time
+		   ,loan_order_number
+		   ,vip_status
+		   ,renew_period
+		   ,vip_flow_group                        --灰度组
+	FROM xyf_dwd.dwd_inloan_leap_vip_order_hf
+	WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_leap_vip_order_hf')
+	AND DATE(order_time) >= '2025-01-01'
+) fy
+ON a.user_no = fy.app_user_id AND r.risk_success_time >= fy.start_time AND r.risk_success_time <= fy.end_time   -- 会员卡开始时间 <= 风险通过时间 <= 会员卡结束时间
+-- 飞享在会状态
+LEFT JOIN
+(
+	SELECT  app_user_id
+		   ,vip_order_number
+	       ,first_vip_order_number
+		   ,order_time
+		   ,pay_time
+	       ,start_time
+	       ,LEAST(CAST(failure_time AS DATETIME), end_time) AS end_time     --飞享存在合约期外退款，把refund_time作为failure_time，因此取两者较小值
+           ,order_number_loan                                                                                           AS loan_order_number
+	FROM xyf_dwd.dwd_user_vip_order_df
+	WHERE pt = MAX_PT('xyf_dwd.dwd_user_vip_order_df')
+	AND vip_card_type = 1
+	AND if_validation <> 0  
+	AND DATE(order_time) >= '2025-01-01'
+) fx
+ON a.user_no = fx.app_user_id AND  r.risk_success_time >= fx.start_time AND r.risk_success_time <= fx.end_time 
+-- 老客额外放开标识
+LEFT JOIN
+(
+	SELECT  biz_first_created 
+		   ,是否额外放开
+	FROM xyf_bi.wzq_order_table 
+) fk_old
+ON a.biz_flow_number = fk_old.biz_first_created 
+-- app首贷额外放开（新客）
+LEFT JOIN xyf_bi.aji_app_rank_order_forbi xujia
+ON a.order_number = xujia.order_number 
+LEFT JOIN
+(
+    SELECT  DISTINCT biz_flow_number
+    FROM xyf_dwd.dwd_inloan_t_decision_result_detail_df
+    WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_t_decision_result_detail_df')
+    AND enginecode IN ('jcl_20240906000005', 'jcl_20240906000003')
+    AND GET_JSON_OBJECT(context, '$.app_laohui_label_output') = 'vip_laohui' 
+) laohui
+ON a.biz_flow_number = laohui.biz_flow_number
+-- api首贷额外放开（新客）
+LEFT JOIN
+(
+    SELECT  DISTINCT biz_flow_number
+    FROM xyf_dwd.dwd_inloan_t_decision_result_detail_df
+    WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_t_decision_result_detail_df')
+    AND decision_time >= '2025-03-01 00:00:00'
+    AND enginecode = 'jcl_20240402000002'
+    AND ( GET_JSON_OBJECT(context, '$.jcl_20240402000002_50_classify_name') = '会员卡捞回' 
+          OR GET_JSON_OBJECT(context, '$.jcl_20240402000002_52_classify_name') = '会员卡捞回' )
+    AND hitresultlist RLIKE 'API转APP人行阶段规则_api' 
+) tp3
+ON a.biz_flow_number = tp3.biz_flow_number
+LEFT JOIN
+(
+    SELECT  DISTINCT biz_flow_number
+    FROM xyf_dwd.dwd_inloan_t_decision_result_detail_df
+    WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_t_decision_result_detail_df')
+    AND decision_time >= '2025-03-01 00:00:00'
+    AND enginecode = 'jcl_20240906000003'
+    AND result = 'PASS' 
+) tp4
+ON tp3.biz_flow_number = tp4.biz_flow_number
+-- APR（按还款计划初始本金与初始息费计算）
+LEFT JOIN
+(
+    SELECT  order_number
+           ,SUM(NVL(initial_interest,0) + NVL(initial_after_loan_fee,0) + NVL(initial_platform_fee,0))     AS initial_interest_fee
+    FROM xyf_dwd.dwd_repay_loan_repay_plan_df
+    WHERE pt = MAX_PT('xyf_dwd.dwd_repay_loan_repay_plan_df') 
+    AND  substr(order_number,1,8) >= '20250601' 
+    GROUP BY order_number
+) rp
+ON a.order_number = rp.order_number
+WHERE r.risk_success_time IS NOT NULL  -- 只统计风险通过的订单
+
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY first_order_number 
+    ORDER BY COALESCE(飞跃会员卡开始时间, '9999-12-31') ASC,
+             COALESCE(飞享会员卡开始时间, '9999-12-31') ASC
+) = 1     --去重，清除一些重复订单，保留飞跃和飞享会员卡开始时间最早的记录
+;
+
+
+DROP TABLE IF EXISTS xyf_jingying.weekly_analysis_report_vip_income_lss;
+CREATE TABLE xyf_jingying.weekly_analysis_report_vip_income_lss AS
+-- 飞享和飞跃会员卡收入、退款、净收入汇总
+-- app首贷
+-- 商业化订单order早于app首贷放款的都算首贷，其余算作复贷收入
+SELECT  COALESCE(fx.pay_date,fy.pay_date,tk.pay_date)             AS pay_date
+       ,COALESCE(fx.首复贷类型,fy.首复贷类型,tk.首复贷类型)       AS 首复贷类型
+-- 飞享卡 
+       ,COALESCE(fx.飞享会员卡收入,0)               AS 飞享会员卡收入
+       ,COALESCE(fx.飞享会员卡退款,0)               AS 飞享会员卡退款
+       ,COALESCE(fx.飞享会员卡净收入,0)             AS 飞享会员卡净收入
+-- 飞跃卡 
+       ,COALESCE(fy.飞跃会员卡收入,0)               AS 飞跃会员卡收入
+       ,COALESCE(fy.飞跃会员卡退款,0)               AS 飞跃会员卡退款
+       ,COALESCE(fy.飞跃会员卡净收入,0)             AS 飞跃会员卡净收入
+-- 提额卡
+       ,COALESCE(tk.提额卡收入,0)                   AS 提额卡收入
+       ,COALESCE(tk.提额卡退款,0)                   AS 提额卡退款
+       ,COALESCE(tk.提额卡净收入,0)                 AS 提额卡净收入
+FROM
+( -- 飞享会员卡收入子查询 
+	SELECT  fx_data.pay_date
+	       ,CASE WHEN a.cust_no IS NOT NULL THEN 'APP首贷'  ELSE 'APP复贷' END      AS 首复贷类型    
+	       ,SUM(fx_data.income)                                                     AS 飞享会员卡收入
+	       ,SUM(fx_data.refund)                                                     AS 飞享会员卡退款
+	       ,SUM(fx_data.income - fx_data.refund)                                    AS 飞享会员卡净收入
+	FROM
+	( -- 飞享收入部分 
+		SELECT  cust_no
+		       ,order_time
+		       ,DATE(pay_time)               AS pay_date
+		       ,NVL(real_card_price,0) / 100 AS income
+		       ,0                            AS refund
+		FROM xyf_dwd.dwd_user_vip_order_df
+		WHERE pt = MAX_PT('xyf_dwd.dwd_user_vip_order_df')
+		AND app_user_id NOT IN ("1061112123", "1055063706", "1043199921", "1028160229", "1034141205")
+		AND vip_card_type = 1
+		AND if_validation <> 0
+		AND pay_time IS NOT NULL
+		AND DATE(pay_time) >= '2025-07-01' 
+		UNION ALL
+		 -- 飞享退款部分 
+		SELECT  cust_no
+		       ,order_time
+		       ,DATE(act_refund_time)          AS pay_date
+		       ,0                          AS income
+		       ,NVL(refund_amount,0) / 100 AS refund
+		FROM xyf_dwd.dwd_user_vip_order_df
+		WHERE pt = MAX_PT('xyf_dwd.dwd_user_vip_order_df')
+		AND app_user_id NOT IN ("1061112123", "1055063706", "1043199921", "1028160229", "1034141205")
+		AND vip_card_type = 1
+		AND if_validation <> 0
+		AND act_refund_time IS NOT NULL
+		AND DATE(act_refund_time) >= '2025-07-01' 
+	) fx_data
+	LEFT JOIN
+	(
+		SELECT  cust_no
+		       ,loan_time
+		FROM xyf_dws.dws_inloan_user_order_df
+		WHERE pt = MAX_PT('xyf_dws.dws_inloan_user_order_df')
+		AND app IN ('xyf01') 
+		AND business_line IN ('APP', '小程序端') --定义APP贷款
+		AND loan_status = 'success' 
+		AND loan_flag = '首贷'
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY cust_no ORDER BY loan_time DESC) = 1   --清洗部分脏数据，保留首贷中的最新放款时间
+	) a
+	ON fx_data.cust_no = a.cust_no AND fx_data.order_time < a.loan_time
+	GROUP BY  fx_data.pay_date
+	         ,CASE WHEN a.cust_no IS NOT NULL THEN 'APP首贷'  ELSE 'APP复贷' END
+) fx
+FULL OUTER JOIN
+( -- 飞跃会员卡收入子查询 
+	SELECT  fy_data.pay_date
+	       ,CASE WHEN a.cust_no IS NOT NULL THEN 'APP首贷'  ELSE 'APP复贷' END      AS 首复贷类型
+	       ,SUM(fy_data.income)                                                     AS 飞跃会员卡收入
+	       ,SUM(fy_data.refund)                                                     AS 飞跃会员卡退款
+	       ,SUM(fy_data.income - fy_data.refund)                                    AS 飞跃会员卡净收入
+	FROM
+	( -- 飞跃收入部分 
+		SELECT  cust_no
+		       ,order_time
+		       ,DATE(pay_time)         AS pay_date
+		       ,NVL(real_card_price,0) AS income
+		       ,0                      AS refund
+		FROM xyf_dwd.dwd_inloan_leap_vip_order_hf
+		WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_leap_vip_order_hf')
+		AND app_user_id NOT IN ("1061112123", "1055063706", "1043199921", "1028160229", "1034141205")
+		AND pay_time IS NOT NULL
+		AND DATE(pay_time) >= '2025-07-01' 
+		UNION ALL
+		 -- 飞跃退款部分 
+		SELECT  cust_no
+		       ,order_time
+		       ,DATE(act_refund_time)       AS pay_date
+		       ,0                       AS income
+		       ,NVL(refund_amount,0)    AS refund
+		FROM xyf_dwd.dwd_inloan_leap_vip_order_hf
+		WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_leap_vip_order_hf')
+		AND app_user_id NOT IN ("1061112123", "1055063706", "1043199921", "1028160229", "1034141205")
+		AND act_refund_time IS NOT NULL
+		AND DATE(act_refund_time) >= '2025-07-01' 
+	) fy_data
+	LEFT JOIN
+	(
+		SELECT  cust_no
+		       ,loan_time
+		FROM xyf_dws.dws_inloan_user_order_df
+		WHERE pt = MAX_PT('xyf_dws.dws_inloan_user_order_df')
+		AND app IN ('xyf01') 
+		AND business_line IN ('APP', '小程序端') --定义APP贷款
+		AND loan_status = 'success' 
+		AND loan_flag = '首贷'
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY cust_no ORDER BY loan_time DESC) = 1   --清洗部分脏数据，保留首贷中的最新放款时间
+	) a
+	ON fy_data.cust_no = a.cust_no AND fy_data.order_time < a.loan_time
+	GROUP BY  fy_data.pay_date
+	         ,CASE WHEN a.cust_no IS NOT NULL THEN 'APP首贷'  ELSE 'APP复贷' END
+) fy
+ON fx.pay_date = fy.pay_date AND fx.首复贷类型 = fy.首复贷类型
+FULL OUTER JOIN
+( -- 提额卡收入子查询
+    SELECT  tk_data.pay_date
+           ,'APP复贷' AS 首复贷类型
+           ,SUM(tk_data.income)                                     AS 提额卡收入
+           ,SUM(tk_data.refund)                                     AS 提额卡退款
+           ,SUM(tk_data.income - tk_data.refund)                    AS 提额卡净收入
+    FROM
+    (
+        SELECT  cust_no
+               ,order_time
+               ,DATE(order_time)           AS pay_date
+               ,NVL(real_order_price,0)    AS income     
+               ,0                          AS refund
+        FROM xyf_dwd.dwd_user_tek_order_df
+        WHERE pt = MAX_PT('xyf_dwd.dwd_user_tek_order_df')
+        AND DATE(order_time) >= '2025-07-01'
+        UNION ALL
+        SELECT  cust_no
+               ,order_time
+               ,DATE(act_refund_time)     AS pay_date
+               ,0                          AS income
+               ,NVL(refund_amount,0)       AS refund    
+        FROM xyf_dwd.dwd_user_tek_order_df
+        WHERE pt = MAX_PT('xyf_dwd.dwd_user_tek_order_df')
+        AND act_refund_time IS NOT NULL
+        AND DATE(act_refund_time) >= '2025-07-01'
+    ) tk_data
+    GROUP BY tk_data.pay_date
+            ,'APP复贷'
+) tk
+ON COALESCE(fx.pay_date, fy.pay_date) = tk.pay_date AND COALESCE(fx.首复贷类型, fy.首复贷类型) = tk.首复贷类型;
+
+-- =  =  =  =  =  =  =  =  =  =  =  =  =  =  = 
+-- 1. APP复贷放款
+-- =  =  =  =  =  =  =  =  =  =  =  =  =  =  =  
+DROP TABLE IF EXISTS xyf_jingying.weekly_analysis_report_fudai_01_lss;
+CREATE TABLE xyf_jingying.weekly_analysis_report_fudai_01_lss AS
+
+SELECT  O.*
+       ,VIP.飞跃会员卡收入
+       ,VIP.飞跃会员卡退款
+       ,VIP.飞跃会员卡净收入
+       ,VIP.飞享会员卡收入
+       ,VIP.飞享会员卡退款
+       ,VIP.飞享会员卡净收入
+       ,VIP.提额卡收入
+       ,VIP.提额卡退款
+       ,VIP.提额卡净收入
+FROM
+(
+	SELECT  放款日期
+	       ,放款月
+	       ,放款周
+	       ,业务线 
+		   
+		   -- 放款（金额口径） 
+	       ,SUM(loan_amt)                                                                               AS 放款金额
+	       ,SUM(initial_interest_fee)                                                                   AS 息费
+	       ,SUM(loan_amt * fee_rate) * 100                                                              AS `金额_定价`
+	       ,SUM(loan_amt * 订单期限)                                                                        AS `金额_期限`
+	       ,SUM(CASE WHEN 资产实际价格 = 'I24' THEN loan_amt ELSE 0 END)                                      AS 实际定价24放款
+	       ,SUM(CASE WHEN 资产实际价格 = 'I36' THEN loan_amt ELSE 0 END)                                      AS 实际定价36放款
+	       ,SUM(CASE WHEN 风险原始定价 = 0.24 THEN loan_amt ELSE 0 END)                                       AS `风险原始定价24放款`
+	       ,SUM(CASE WHEN 风险原始定价 = 0.24 AND 飞跃在会 = '非在会' THEN loan_amt ELSE 0 END)                      AS `风险原始定价24放款_飞跃非在会`
+	       ,SUM(CASE WHEN 风险原始定价 = 0.24 AND 飞跃在会 = '在会' THEN loan_amt ELSE 0 END)                       AS `风险原始定价24放款_飞跃在会`
+	       ,SUM(CASE WHEN 飞跃在会已扣得 = 1 THEN loan_amt ELSE 0 END)                                         AS 飞跃已扣在会放款
+	       ,SUM(CASE WHEN 飞跃在会 <> '非在会' THEN loan_amt ELSE 0 END)                                       AS 飞跃在会放款
+	       ,SUM(CASE WHEN 飞享在会 <> '非在会' THEN loan_amt ELSE 0 END)                                       AS 飞享在会放款
+	       ,SUM(CASE WHEN 是否额外放开 = 1 THEN loan_amt ELSE 0 END)                                          AS 额外放开放款
+	       ,SUM(CASE WHEN 离线评级 IN ('A1','A2') THEN loan_amt ELSE 0 END)                                 AS 离线评级A放款 
+		   
+		   -- 放款（订单口径） 
+	       ,COUNT(DISTINCT original_order_no)                                                           AS 放款订单数
+	       ,COUNT(DISTINCT user_no)                                                                     AS 放款人数
+	       ,SUM(CASE WHEN split_rn = 1 THEN fee_rate ELSE 0 END) * 100                                  AS `sum_定价`
+	       ,SUM(CASE WHEN split_rn = 1 THEN 订单期限 ELSE 0 END)                                            AS sum_期限
+	       ,COUNT(CASE WHEN split_rn = 1 AND 资产实际价格 = 'I24' THEN original_order_no END)                 AS 实际定价24放款订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 资产实际价格 = 'I36' THEN original_order_no END)                 AS 实际定价36放款订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 风险原始定价 = 0.24 THEN original_order_no END)                  AS `风险原始定价24订单数`
+	       ,COUNT(CASE WHEN split_rn = 1 AND 风险原始定价 = 0.24 AND 飞跃在会 = '非在会' THEN original_order_no END) AS `风险原始定价24订单数_飞跃非在会`
+	       ,COUNT(CASE WHEN split_rn = 1 AND 风险原始定价 = 0.24 AND 飞跃在会 = '在会' THEN original_order_no END)  AS `风险原始定价24订单数_飞跃在会`
+	       ,COUNT(CASE WHEN split_rn = 1 AND 飞跃在会已扣得 = 1 THEN original_order_no END)                    AS 飞跃已扣在会订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 飞跃在会 <> '非在会' THEN original_order_no END)                  AS 飞跃在会订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 飞享在会 <> '非在会' THEN original_order_no END)                  AS 飞享在会订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 是否额外放开 = 1 THEN original_order_no END)                     AS 额外放开订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 离线评级 IN ('A1','A2') THEN original_order_no END)            AS 离线评级A订单数
+	FROM xyf_jingying.weekly_analysis_report_df_lss
+	WHERE 放款时间 IS NOT NULL
+	AND 业务线 = 'APP复贷'
+	GROUP BY  放款日期
+	         ,放款月
+	         ,放款周
+	         ,业务线
+) O
+LEFT JOIN xyf_jingying.weekly_analysis_report_vip_income_lss VIP
+ON VIP.pay_date = O.放款日期 AND VIP.首复贷类型 = O.业务线;
+
+-- =  =  =  =  =  =  =  =  =  =  =  =  =  =  = 
+-- 2. APP首贷放款
+-- =  =  =  =  =  =  =  =  =  =  =  =  =  =  =  
+DROP TABLE IF EXISTS xyf_jingying.weekly_analysis_report_shoudai_01_lss;
+CREATE TABLE xyf_jingying.weekly_analysis_report_shoudai_01_lss AS
+
+SELECT  O.*
+       ,VIP.飞跃会员卡收入
+       ,VIP.飞跃会员卡退款
+       ,VIP.飞跃会员卡净收入
+       ,VIP.飞享会员卡收入
+       ,VIP.飞享会员卡退款
+       ,VIP.飞享会员卡净收入
+FROM
+(
+	SELECT  放款日期
+	       ,放款月
+	       ,放款周
+	       ,业务线 
+		   
+		   -- 放款（金额口径） 
+	       ,SUM(loan_amt)                                                                               AS 放款金额
+	       ,SUM(initial_interest_fee)                                                                   AS 息费
+	       ,SUM(loan_amt * fee_rate) * 100                                                              AS `金额_定价`
+	       ,SUM(loan_amt * 订单期限)                                                                        AS `金额_期限`
+	       ,SUM(CASE WHEN 资产实际价格 = 'I24' THEN loan_amt ELSE 0 END)                                      AS 实际定价24放款
+	       ,SUM(CASE WHEN 资产实际价格 = 'I36' THEN loan_amt ELSE 0 END)                                      AS 实际定价36放款
+	       ,SUM(CASE WHEN 风险原始定价 = 0.24 THEN loan_amt ELSE 0 END)                                       AS `风险原始定价24放款`
+	       ,SUM(CASE WHEN 风险原始定价 = 0.24 AND 飞跃在会 = '非在会' THEN loan_amt ELSE 0 END)                      AS `风险原始定价24放款_飞跃非在会`
+	       ,SUM(CASE WHEN 风险原始定价 = 0.24 AND 飞跃在会 = '在会' THEN loan_amt ELSE 0 END)                       AS `风险原始定价24放款_飞跃在会`
+	       ,SUM(CASE WHEN 飞跃在会已扣得 = 1 THEN loan_amt ELSE 0 END)                                         AS 飞跃已扣在会放款
+	       ,SUM(CASE WHEN 飞跃在会 <> '非在会' THEN loan_amt ELSE 0 END)                                       AS 飞跃在会放款
+	       ,SUM(CASE WHEN 飞享在会 <> '非在会' THEN loan_amt ELSE 0 END)                                       AS 飞享在会放款
+	       ,SUM(CASE WHEN 是否额外放开 = 1 THEN loan_amt ELSE 0 END)                                          AS 额外放开放款
+	       ,SUM(CASE WHEN 离线评级 IN ('A1','A2') THEN loan_amt ELSE 0 END)                                 AS 离线评级A放款 
+		   
+		   -- 放款（订单口径） 
+	       ,COUNT(DISTINCT original_order_no)                                                           AS 放款订单数
+	       ,COUNT(DISTINCT user_no)                                                                     AS 放款人数
+	       ,SUM(CASE WHEN split_rn = 1 THEN fee_rate ELSE 0 END) * 100                                  AS `sum_定价`
+	       ,SUM(CASE WHEN split_rn = 1 THEN 订单期限 ELSE 0 END)                                            AS sum_期限
+	       ,COUNT(CASE WHEN split_rn = 1 AND 资产实际价格 = 'I24' THEN original_order_no END)                 AS 实际定价24放款订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 资产实际价格 = 'I36' THEN original_order_no END)                 AS 实际定价36放款订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 风险原始定价 = 0.24 THEN original_order_no END)                  AS `风险原始定价24订单数`
+	       ,COUNT(CASE WHEN split_rn = 1 AND 风险原始定价 = 0.24 AND 飞跃在会 = '非在会' THEN original_order_no END) AS `风险原始定价24订单数_飞跃非在会`
+	       ,COUNT(CASE WHEN split_rn = 1 AND 风险原始定价 = 0.24 AND 飞跃在会 = '在会' THEN original_order_no END)  AS `风险原始定价24订单数_飞跃在会`
+	       ,COUNT(CASE WHEN split_rn = 1 AND 飞跃在会已扣得 = 1 THEN original_order_no END)                    AS 飞跃已扣在会订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 飞跃在会 <> '非在会' THEN original_order_no END)                  AS 飞跃在会订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 飞享在会 <> '非在会' THEN original_order_no END)                  AS 飞享在会订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 是否额外放开 = 1 THEN original_order_no END)                     AS 额外放开订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 离线评级 IN ('A1','A2') THEN original_order_no END)            AS 离线评级A订单数
+	FROM xyf_jingying.weekly_analysis_report_df_lss
+	WHERE 放款时间 IS NOT NULL
+	AND 业务线 = 'APP首贷'
+	GROUP BY  放款日期
+	         ,放款月
+	         ,放款周
+	         ,业务线
+) O
+LEFT JOIN xyf_jingying.weekly_analysis_report_vip_income_lss VIP
+ON VIP.pay_date = O.放款日期 AND VIP.首复贷类型 = O.业务线;
+
+-- =  =  =  =  =  =  =  =  =  =  =  =  =  =  = 
+-- 3. API首复贷放款
+-- =  =  =  =  =  =  =  =  =  =  =  =  =  =  =  
+DROP TABLE IF EXISTS xyf_jingying.weekly_analysis_report_api_01_lss;
+CREATE TABLE xyf_jingying.weekly_analysis_report_api_01_lss AS
+
+--- 飞星卡需要确认下逻辑是否正确，重新确认下out_order_number能否关联
+
+
+WITH fxing_data AS
+( -- 飞星卡收入 
+	SELECT  a.inner_app
+	       ,a.order_no
+	       ,a.status
+	       ,a.create_time
+	       ,c.loan_flag
+	       ,CASE WHEN a.inner_app = 'xyf01_rs03' THEN a.rs_paid_amount  ELSE b.paid_amount END AS paid_amount
+	FROM
+	(
+		SELECT  inner_app
+		       ,order_no --外部进件订单号 
+		       ,status --loan_apply, cancel_order, remit_succes, pay_fail, pay_success, refund_success 
+		       ,create_time
+		       ,GET_JSON_OBJECT(notify_raw_data,'$.rightsOrderNo') AS rights_order_no --rs的没有这个参数 
+		       ,GET_JSON_OBJECT(notify_raw_data,'$.amount')/100    AS rs_paid_amount --rs的权益价格直接取这个数 
+		FROM xyf_dwd.dwd_xyf_api_channel_benefit_order_change_log_df
+		WHERE pt = MAX_PT('xyf_dwd.dwd_xyf_api_channel_benefit_order_change_log_df')
+		AND status IN ('pay_success', 'refund_success') 
+	) a
+	LEFT JOIN
+	(
+		SELECT  out_biz_no
+		       ,repaid_amount/100 AS paid_amount
+		FROM xyf_dwd.dwd_mysql_rightssupplier_rsc_rights_order_df
+		WHERE pt = MAX_PT('xyf_dwd.dwd_mysql_rightssupplier_rsc_rights_order_df') 
+	) b
+	ON a.rights_order_no = b.out_biz_no
+	LEFT JOIN
+	(
+		SELECT  out_order_number      --外部进件订单号 
+		       ,inner_app
+		       ,loan_flag
+		FROM xyf_dws.dws_inloan_user_order_df
+		WHERE pt = MAX_PT('xyf_dws.dws_inloan_user_order_df') 
+	) c
+	ON c.out_order_number = a.order_no    ---xyf01_rs03有30多个订单关联不上
+), 
+fxing_income AS
+(
+	SELECT  fxing.pay_date
+	       ,fxing.loan_flag
+	       ,fxing.inner_app
+	       ,SUM(fxing.income)                AS 飞星卡收入
+	       ,SUM(fxing.refund)                AS 飞星卡退款
+	       ,SUM(fxing.income - fxing.refund) AS 飞星卡净收入
+	FROM
+	( -- 飞星卡收入 
+		SELECT  DATE(create_time) AS pay_date
+		       ,inner_app
+		       ,loan_flag
+		       ,paid_amount       AS income
+		       ,0                 AS refund
+		FROM fxing_data
+		WHERE status = 'pay_success' 
+		UNION ALL
+		 -- 飞星卡退款 
+		SELECT  DATE(create_time) AS pay_date
+		       ,inner_app
+		       ,loan_flag
+		       ,0                 AS income
+		       ,paid_amount       AS refund
+		FROM fxing_data
+		WHERE status = 'refund_success' 
+	) fxing
+	GROUP BY  fxing.pay_date
+	         ,fxing.loan_flag
+	         ,fxing.inner_app
+) 
+			 
+SELECT  O.*
+       ,fxing_income.飞星卡收入
+       ,fxing_income.飞星卡退款
+       ,fxing_income.飞星卡净收入
+FROM
+(
+	SELECT  放款日期
+	       ,放款月
+	       ,放款周
+	       ,业务线
+	       ,loan_flag
+	       ,inner_app 
+
+		   -- 放款（金额口径） 
+	       ,SUM(loan_amt)                                                       AS 放款金额
+	       ,SUM(initial_interest_fee)                                           AS 息费
+	       ,SUM(loan_amt * fee_rate) * 100                                      AS `金额_定价`
+	       ,SUM(loan_amt * 订单期限)                                            AS `金额_期限`
+	       ,SUM(CASE WHEN 资产实际价格 = 'I24' THEN loan_amt ELSE 0 END)        AS 实际定价24放款
+	       ,SUM(CASE WHEN 资产实际价格 = 'I36' THEN loan_amt ELSE 0 END)        AS 实际定价36放款
+	       ,SUM(CASE WHEN 风险原始定价 = 0.24 THEN loan_amt ELSE 0 END)         AS `风险原始定价24放款`
+	       ,SUM(CASE WHEN 是否额外放开 = 1 THEN loan_amt ELSE 0 END)            AS 额外放开放款
+	       ,SUM(CASE WHEN 离线评级 IN ('A1','A2') THEN loan_amt ELSE 0 END)     AS 离线评级A放款
+	       ,SUM(CASE WHEN 是否飞星卡订单 = 1 THEN loan_amt ELSE 0 END)          AS 飞星卡订单放款 
+
+		   -- 放款（订单口径）  
+	       ,COUNT(DISTINCT original_order_no)                                                           AS 放款订单数
+	       ,COUNT(DISTINCT user_no)                                                                     AS 放款人数
+	       ,SUM(CASE WHEN split_rn = 1 THEN fee_rate ELSE 0 END) * 100                                  AS `sum_定价`
+	       ,SUM(CASE WHEN split_rn = 1 THEN 订单期限 ELSE 0 END)                                         AS sum_期限
+	       ,COUNT(CASE WHEN split_rn = 1 AND 资产实际价格 = 'I24' THEN original_order_no END)                 AS 实际定价24放款订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 资产实际价格 = 'I36' THEN original_order_no END)                 AS 实际定价36放款订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 风险原始定价 = 0.24 THEN original_order_no END)                  AS `风险原始定价24订单数`
+	       ,COUNT(CASE WHEN split_rn = 1 AND 是否额外放开 = 1 THEN original_order_no END)                     AS 额外放开订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 离线评级 IN ('A1','A2') THEN original_order_no END)            AS 离线评级A订单数
+	       ,COUNT(CASE WHEN split_rn = 1 AND 是否飞星卡订单 = 1 THEN order_number END)        AS 飞星卡订单数
+	FROM
+	(
+		SELECT  a.*
+		       ,CASE WHEN fxing.order_no IS NOT NULL THEN 1  ELSE 0 END AS 是否飞星卡订单
+		FROM xyf_jingying.weekly_analysis_report_df_lss a
+		LEFT JOIN -- 是否飞星卡订单（API 24+权益） 
+		(
+			SELECT  DISTINCT order_no
+			FROM xyf_dwd.dwd_xyf_api_channel_benefit_order_change_log_df
+			WHERE pt = MAX_PT('xyf_dwd.dwd_xyf_api_channel_benefit_order_change_log_df') 
+		) fxing
+		ON a.out_order_number = fxing.order_no
+		WHERE 放款时间 IS NOT NULL
+		AND 业务线 = 'API首复贷' 
+	)
+	GROUP BY  放款日期
+	         ,放款月
+	         ,放款周
+	         ,业务线
+	         ,loan_flag
+	         ,inner_app
+) O
+LEFT JOIN fxing_income
+ON fxing_income.pay_date = O.放款日期 AND fxing_income.loan_flag = O.loan_flag AND  fxing_income.inner_app = O.inner_app;
+
+
+-- =  =  =  =  =  =  =  =  =  =  =  =  =  =  = 
+-- 4. 资产生成 （只看风险通过）
+-- =  =  =  =  =  =  =  =  =  =  =  =  =  =  =  
+DROP TABLE IF EXISTS xyf_jingying.weekly_analysis_report_asset_lss;
+CREATE TABLE xyf_jingying.weekly_analysis_report_asset_lss AS
+
+SELECT  订单发起日期
+       ,订单发起月
+       ,订单发起周
+       ,业务线
+-- 资产生成（金额口径）
+       ,SUM(CASE WHEN split_rn = 1 THEN order_amt ELSE 0 END)                        AS 资产金额
+       ,SUM(CASE WHEN 2h内资金通过 = 1 THEN loan_amt ELSE 0 END)                      AS 2h内资金通过金额
+       ,SUM(CASE WHEN 24h内资金通过 = 1 THEN loan_amt ELSE 0 END)                     AS 24h内资金通过金额
+       ,SUM(CASE WHEN 72h内资金通过 = 1 THEN loan_amt ELSE 0 END)                     AS 72h内资金通过金额
+       ,SUM(CASE WHEN 放款时间 IS NOT NULL THEN loan_amt ELSE 0 END)                 AS tilnow资金通过金额
+       ,SUM(CASE WHEN split_rn = 1 AND 风险原始定价 = 0.24 THEN order_amt ELSE 0 END)  AS 风险原始定价24资产
+       ,SUM(CASE WHEN split_rn = 1 AND 资产实际价格 = 'I24' THEN order_amt ELSE 0 END) AS 实际定价24资产
+-- 资产生成（订单口径），记录的是拆分订单后真实路由的订单数
+       ,COUNT(DISTINCT order_number)                                             AS 资产订单数
+       ,COUNT(DISTINCT user_no)                                                  AS 发起人数
+       ,SUM(`2h内资金通过`)                                                           AS 2h内资金通过订单数
+       ,SUM(`24h内资金通过`)                                                          AS 24h内资金通过订单数
+       ,SUM(`72h内资金通过`)                                                          AS 72h内资金通过订单数
+       ,COUNT(DISTINCT CASE WHEN 放款时间 IS NOT NULL THEN order_number END)         AS tilnow资金通过订单数
+       ,COUNT(DISTINCT CASE WHEN 风险原始定价 = 0.24 THEN order_number END)            AS 风险原始定价24订单数
+       ,COUNT(DISTINCT CASE WHEN 资产实际价格 = 'I24' THEN order_number END)           AS 实际定价24订单数
+FROM xyf_jingying.weekly_analysis_report_df_lss
+WHERE 风险通过时间 IS NOT NULL
+AND 业务线 <> '其他'
+GROUP BY  订单发起日期
+         ,订单发起月
+         ,订单发起周
+         ,业务线

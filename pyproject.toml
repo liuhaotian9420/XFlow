@@ -5,13 +5,20 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "dotenv>=0.9.9",
     "fastapi>=0.135.1",
     "numpy>=2.4.3",
+    "openpyxl>=3.1.5",
     "pandas>=2.3.3",
+    "pydotenv>=0.0.7",
+    "pyodps>=0.12.6",
+    "python-dotenv>=1.2.2",
     "python-multipart>=0.0.22",
+    "pyyaml>=6.0.3",
     "requests>=2.32.5",
     "streamlit>=1.55.0",
     "uvicorn>=0.42.0",
+    "xlsxwriter>=3.2.9",
 ]
 
 [project.scripts]
@@ -20,3 +27,9 @@ xyf-competition-mvp = "xyf_competition_mvp:main"
 [build-system]
 requires = ["uv_build>=0.10.7,<0.11.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: multi-component or mocked external system tests",
+    "e2e: full Codex CLI path (slow; opt-in)",
+]

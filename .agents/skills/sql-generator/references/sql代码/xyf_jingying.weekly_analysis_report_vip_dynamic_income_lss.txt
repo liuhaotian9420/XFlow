@@ -1,0 +1,185 @@
+--@exclude_input=xyf_dwd.dwd_inloan_leap_vip_order_hf
+--@exclude_input=xyf_dwd.dwd_user_vip_order_df
+--odps sql 
+--********************************************************************--
+--author:李水森
+--create time:2025-10-13 14:02:43
+--********************************************************************--
+-- 动态收入口径（按 vip_order_time 基准）：
+-- 输出每笔订单在 T0/T7/T20/T30/T60 的累积扣得、累积退款、累积净收入 
+DROP TABLE IF EXISTS xyf_jingying.weekly_analysis_report_vip_dynamic_income_lss;
+CREATE TABLE xyf_jingying.weekly_analysis_report_vip_dynamic_income_lss AS
+
+WITH calc_income AS
+(
+	SELECT  u.app_user_id
+	       ,u.cust_no
+	       ,u.vip_order_time
+	       ,DATE(u.vip_order_time)                                                                                 AS vip_order_date
+	       ,ow.day_week                                                                                            AS vip_order_week
+	       ,SUBSTR(u.vip_order_time,1,7)                                                                           AS vip_order_month
+           ,day_weekend_xf_new                                                                                     AS vip_order_week_end
+           ,LAST_DAY(DATE(u.vip_order_time))                                                                       AS vip_order_month_end
+	       ,u.card_type
+	       ,u.card_type_cn 
+		   ,pay_amt
+	       ,CASE WHEN DATEDIFF(DATE(u.pay_time),DATE(u.vip_order_time)) <= 0 THEN u.pay_amt  ELSE 0 END            AS income_T0
+	       ,CASE WHEN DATEDIFF(DATE(u.pay_time),DATE(u.vip_order_time)) <= 7 THEN u.pay_amt  ELSE 0 END            AS income_T7
+	       ,CASE WHEN DATEDIFF(DATE(u.pay_time),DATE(u.vip_order_time)) <= 20 THEN u.pay_amt  ELSE 0 END           AS income_T20
+	       ,CASE WHEN DATEDIFF(DATE(u.pay_time),DATE(u.vip_order_time)) <= 30 THEN u.pay_amt  ELSE 0 END           AS income_T30
+	       ,CASE WHEN DATEDIFF(DATE(u.pay_time),DATE(u.vip_order_time)) <= 60 THEN u.pay_amt  ELSE 0 END           AS income_T60
+	       ,CASE WHEN DATEDIFF(DATE(u.act_refund_time),DATE(u.vip_order_time)) <= 0 THEN u.refund_amt  ELSE 0 END  AS refund_T0
+	       ,CASE WHEN DATEDIFF(DATE(u.act_refund_time),DATE(u.vip_order_time)) <= 7 THEN u.refund_amt  ELSE 0 END  AS refund_T7
+	       ,CASE WHEN DATEDIFF(DATE(u.act_refund_time),DATE(u.vip_order_time)) <= 20 THEN u.refund_amt  ELSE 0 END AS refund_T20
+	       ,CASE WHEN DATEDIFF(DATE(u.act_refund_time),DATE(u.vip_order_time)) <= 30 THEN u.refund_amt  ELSE 0 END AS refund_T30
+	       ,CASE WHEN DATEDIFF(DATE(u.act_refund_time),DATE(u.vip_order_time)) <= 60 THEN u.refund_amt  ELSE 0 END AS refund_T60
+	FROM
+	(
+		SELECT  fx_fy_data.app_user_id
+		       ,fx_fy_data.cust_no
+		       ,fx_fy_data.vip_order_time
+		       ,fx_fy_data.card_type
+		       ,fx_fy_data.card_type_cn
+		       ,fx_fy_data.pay_amt
+		       ,fx_fy_data.pay_time
+		       ,fx_fy_data.act_refund_time
+		       ,fx_fy_data.refund_amt
+		FROM
+		( -- 飞享卡
+			SELECT  app_user_id
+			       ,cust_no
+			       ,order_time                   AS vip_order_time
+			       ,'vip'                        AS card_type
+			       ,'飞享卡'                     AS card_type_cn
+			       ,NVL(real_card_price,0) / 100 AS pay_amt -- 应收会费（单位：分） 
+			       ,pay_time
+			       ,act_refund_time
+			       ,NVL(refund_amount,0) / 100   AS refund_amt
+			FROM xyf_dwd.dwd_user_vip_order_df
+			WHERE pt = MAX_PT('xyf_dwd.dwd_user_vip_order_df')
+			AND vip_card_type = 1
+			AND if_validation <> 0
+			AND app_user_id NOT IN ("1061112123", "1055063706", "1043199921", "1028160229", "1034141205")
+			AND DATE(order_time) >= '2025-07-01' 
+			UNION ALL
+			 -- 飞跃卡 
+			SELECT  app_user_id
+			       ,cust_no
+			       ,order_time             AS vip_order_time
+			       ,'leap'                 AS card_type
+			       ,'飞跃卡'               AS card_type_cn
+			       ,NVL(real_card_price,0) AS pay_amt -- 应收会费 
+			       ,pay_time
+			       ,act_refund_time
+			       ,NVL(refund_amount,0)   AS refund_amt
+			FROM xyf_dwd.dwd_inloan_leap_vip_order_hf
+			WHERE pt = MAX_PT('xyf_dwd.dwd_inloan_leap_vip_order_hf')
+			AND app_user_id NOT IN ("1061112123", "1055063706", "1043199921", "1028160229", "1034141205")
+			AND DATE(order_time) >= '2025-07-01' 
+			AND DATE(order_time) <= DATE_SUB(CURRENT_DATE(),1)
+		) fx_fy_data
+		LEFT JOIN
+		(
+			SELECT  cust_no
+			       ,loan_time
+			FROM xyf_dws.dws_inloan_user_order_df
+			WHERE pt = MAX_PT('xyf_dws.dws_inloan_user_order_df')
+			AND app IN ('xyf01')
+			AND business_line IN ('APP', '小程序端') --定义APP贷款 
+			AND loan_status = 'success'
+			AND loan_flag = '首贷' 
+			QUALIFY ROW_NUMBER() OVER (PARTITION BY cust_no ORDER BY loan_time DESC) = 1 --清洗部分脏数据，保留首贷中的最新放款时间 
+		) a
+		ON fx_fy_data.cust_no = a.cust_no AND fx_fy_data.vip_order_time < a.loan_time
+		WHERE a.cust_no IS NULL 
+
+		UNION ALL
+		
+		 -- 提额卡
+		SELECT  app_user_id
+		       ,cust_no
+		       ,order_time              AS vip_order_time
+		       ,'tek'                   AS card_type
+		       ,'提额卡'                AS card_type_cn
+		       ,NVL(real_order_price,0) AS pay_amt  -- 应收会费 
+		       ,order_time              AS pay_time -- 提额卡下单即支付 
+		       ,act_refund_time
+		       ,NVL(refund_amount,0)    AS refund_amt
+		FROM xyf_dwd.dwd_user_tek_order_df
+		WHERE pt = MAX_PT('xyf_dwd.dwd_user_tek_order_df')
+		AND DATE(order_time) >= '2025-07-01' 
+		AND DATE(order_time) <= DATE_SUB(CURRENT_DATE(),1)
+	) u
+	LEFT JOIN
+	(
+		SELECT  day_id_iso
+		       ,day_weekend_xf_new
+		       ,CONCAT(day_week01_xf_new,'~',day_weekend_xf_new) AS day_week
+		FROM xyf_dim.dim_pub_date
+		WHERE day_id_iso >= '2025-07-01' 
+	) ow
+	ON DATE(u.vip_order_time) = ow.day_id_iso
+)
+
+-- 按周维度汇总
+SELECT  vip_order_week                                                                                                           AS date
+       ,'会员卡订单周'                                                                                                             AS date_type
+       ,card_type_cn
+       ,SUM(pay_amt)                                                                                                             AS 应收会费总额
+-- 累积扣得 
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 0 THEN SUM(income_T0) END                AS 累积扣得_T0
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 7 THEN SUM(income_T7) END                AS 累积扣得_T7
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 20 THEN SUM(income_T20) END              AS 累积扣得_T20
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 30 THEN SUM(income_T30) END              AS 累积扣得_T30
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 60 THEN SUM(income_T60) END              AS 累积扣得_T60
+-- 累计退款 
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 0 THEN SUM(refund_T0) END                AS 累积退款_T0
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 7 THEN SUM(refund_T7) END                AS 累积退款_T7
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 20 THEN SUM(refund_T20) END              AS 累积退款_T20
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 30 THEN SUM(refund_T30) END              AS 累积退款_T30
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 60 THEN SUM(refund_T60) END              AS 累积退款_T60
+-- 累积净收入 
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 0 THEN SUM(income_T0 - refund_T0) END    AS 累积净收入_T0
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 7 THEN SUM(income_T7 - refund_T7) END    AS 累积净收入_T7
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 20 THEN SUM(income_T20 - refund_T20) END AS 累积净收入_T20
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 30 THEN SUM(income_T30 - refund_T30) END AS 累积净收入_T30
+       ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_week_end))) >= 60 THEN SUM(income_T60 - refund_T60) END AS 累积净收入_T60
+FROM calc_income
+GROUP BY  vip_order_week
+         ,card_type_cn
+
+UNION ALL
+-- 按月维度汇总
+SELECT  vip_order_month                                                                                                          AS date
+	   ,'会员卡订单月'                                                                                                           AS date_type
+	   ,card_type_cn
+	   ,SUM(pay_amt)                                                                                                             AS 应收会费总额
+
+-- 累积扣得 
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 0 THEN SUM(income_T0) END               AS 累积扣得_T0
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 7 THEN SUM(income_T7) END               AS 累积扣得_T7
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 20 THEN SUM(income_T20) END             AS 累积扣得_T20
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 30 THEN SUM(income_T30) END             AS 累积扣得_T30
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 60 THEN SUM(income_T60) END             AS 累积扣得_T60
+
+-- 累计退款 
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 0 THEN SUM(refund_T0) END               AS 累积退款_T0
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 7 THEN SUM(refund_T7) END               AS 累积退款_T7
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 20 THEN SUM(refund_T20) END             AS 累积退款_T20
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 30 THEN SUM(refund_T30) END             AS 累积退款_T30
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 60 THEN SUM(refund_T60) END             AS 累积退款_T60
+-- 累积净收入 
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 0 THEN SUM(income_T0 - refund_T0) END   AS 累积净收入_T0
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 7 THEN SUM(income_T7 - refund_T7) END   AS 累积净收入_T7
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 20 THEN SUM(income_T20 - refund_T20) END AS 累积净收入_T20
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 30 THEN SUM(income_T30 - refund_T30) END AS 累积净收入_T30
+	   ,CASE WHEN DATEDIFF(DATE_SUB(CURRENT_DATE(),1),MAX(DATE(vip_order_month_end))) >= 60 THEN SUM(income_T60 - refund_T60) END AS 累积净收入_T60
+FROM calc_income		
+GROUP BY  vip_order_month
+		 ,card_type_cn;
+
+
+
+
+
+

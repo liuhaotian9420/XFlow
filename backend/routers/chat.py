@@ -20,7 +20,7 @@ from backend.chat_store import (
 from backend.codex.errors import CodexAdapterError
 from backend.codex.factory import get_provider
 from backend.codex.mock import MockProvider
-from backend.codex.xinfei_sso import resolve_codex_executable
+from backend.codex.xinfei_sso import is_xinfei_enterprise_binary, resolve_codex_executable
 from backend.observability import log_event
 
 router = APIRouter(tags=["chat"])
@@ -39,6 +39,37 @@ def _effective_reasoning_effort(
 ) -> str | None:
     value = (reasoning_effort or "").strip() or (think_level or "").strip()
     return value or None
+
+
+def _auth_hint_for_chat_error(detail: str, *, codex_bin: str) -> str | None:
+    low = detail.lower()
+    auth_like = any(
+        token in low
+        for token in (
+            "not logged in",
+            "enterprise sso",
+            "expired",
+            "refresh token",
+            "access token",
+            "unauthorized",
+            "401",
+            "forbidden",
+            "403",
+            "stream disconnected",
+            "no last agent message",
+        )
+    )
+    if not auth_like:
+        return None
+    if is_xinfei_enterprise_binary(codex_bin):
+        return (
+            "Likely Xinfei Codex auth issue (not logged in or session expired). "
+            "Run `codex login status` and, if needed, "
+            "`codex login --enterprise-sso` (use the same CODEX_HOME as backend)."
+        )
+    return (
+        "Likely Codex auth/session issue. Run `codex login status` and re-login if needed."
+    )
 
 
 class ChatMessage(BaseModel):
@@ -74,7 +105,10 @@ class ChatResponse(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_input_tokens: int | None = None
+    skill_hints: list[str] | None = None
     api_elapsed_s: float | None = None
+    runtime_vendor: str | None = None
+    runtime_binary: str | None = None
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -120,6 +154,7 @@ async def chat_message(
     )
 
     resolved_codex = resolve_codex_executable()
+    adapter_command = str(getattr(adapter, "command", "") or "").strip() or resolved_codex
     provider_name = type(adapter).__name__
     extra = ""
     if hasattr(adapter, "command"):
@@ -187,6 +222,7 @@ async def chat_message(
             resolved_codex,
         )
         if not use_mock_flag and explicit is False:
+            hint = _auth_hint_for_chat_error(error_text or "", codex_bin=adapter_command)
             save_chat_turn(
                 {
                     "turn_id": turn_id,
@@ -236,6 +272,7 @@ async def chat_message(
                     f"{type(exc).__name__}: {exc!s}. "
                     "Check server logs for the full traceback, verify Codex CLI auth/config, "
                     "or re-enable mock in the UI."
+                    + (f" Hint: {hint}" if hint else "")
                 ),
             ) from exc
         reply = await MockProvider().chat(
@@ -261,6 +298,20 @@ async def chat_message(
         provider_overhead_elapsed_s_out = max(
             0.0, float(provider_elapsed_s) - float(codex_exec_elapsed_s)
         )
+    runtime_vendor: str | None = None
+    runtime_binary: str | None = None
+    if is_fallback:
+        runtime_vendor = "mock-fallback"
+    elif use_mock_flag:
+        runtime_vendor = "mock"
+    else:
+        runtime_vendor = (
+            "xinfei-codex"
+            if is_xinfei_enterprise_binary(adapter_command)
+            else "native-codex"
+        )
+        runtime_binary = adapter_command
+
     response = ChatResponse(
         session_id=session_id,
         turn_id=turn_id,
@@ -283,7 +334,10 @@ async def chat_message(
         input_tokens=getattr(adapter, "last_input_tokens", None),
         output_tokens=getattr(adapter, "last_output_tokens", None),
         cached_input_tokens=getattr(adapter, "last_cached_input_tokens", None),
+        skill_hints=getattr(adapter, "last_skill_hints", None),
         api_elapsed_s=time.perf_counter() - t0,
+        runtime_vendor=runtime_vendor,
+        runtime_binary=runtime_binary,
     )
     save_chat_turn(
         {

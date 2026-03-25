@@ -1,0 +1,5 @@
+{
+  "id": "two_skill_serial_smoke",
+  "title": "Serial: sql-generator → sql-export-agent (dataworks)",
+  "business_request": "请用尽可能短的单条 ODPS SQL（字面量 SELECT 即可）演示联调：查询一行两列 id=1（BIGINT）、label='ok'（STRING）。不要引用真实业务表。后续步骤需要把生成的 .sql 交给 run_sql_export.py。"
+}

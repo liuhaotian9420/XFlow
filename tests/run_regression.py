@@ -43,12 +43,22 @@ async def run_case(case: dict, fixtures_dir: Path, mode: str) -> dict:
         adapter = get_adapter()
 
     ok = True
+    parse_success = False
     errors: list[str] = []
     chart_type = ""
+    skill_hints: list[str] | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_input_tokens: int | None = None
     try:
         plan = await adapter.generate_plan(
             question=case["question"], schema_profile=profile, task_id=f"reg-{case['name']}"
         )
+        parse_success = True
+        skill_hints = getattr(adapter, "last_skill_hints", None)
+        input_tokens = getattr(adapter, "last_input_tokens", None)
+        output_tokens = getattr(adapter, "last_output_tokens", None)
+        cached_input_tokens = getattr(adapter, "last_cached_input_tokens", None)
         result = run_plan(df=df, plan=plan)
         chart_type = result.chart.chart_type.value
         if chart_type != case["expected_chart_type"]:
@@ -59,11 +69,30 @@ async def run_case(case: dict, fixtures_dir: Path, mode: str) -> dict:
     except CodexAdapterError as exc:
         ok = False
         errors.append(f"codex_error: {exc}")
+        skill_hints = getattr(adapter, "last_skill_hints", None)
+        input_tokens = getattr(adapter, "last_input_tokens", None)
+        output_tokens = getattr(adapter, "last_output_tokens", None)
+        cached_input_tokens = getattr(adapter, "last_cached_input_tokens", None)
     except Exception as exc:  # pragma: no cover
         ok = False
         errors.append(f"unexpected_error: {exc}")
+        skill_hints = getattr(adapter, "last_skill_hints", None)
+        input_tokens = getattr(adapter, "last_input_tokens", None)
+        output_tokens = getattr(adapter, "last_output_tokens", None)
+        cached_input_tokens = getattr(adapter, "last_cached_input_tokens", None)
 
-    return {"case": case["name"], "mode": mode, "ok": ok, "chart_type": chart_type, "errors": errors}
+    return {
+        "case": case["name"],
+        "mode": mode,
+        "ok": ok,
+        "parse_success": parse_success,
+        "chart_type": chart_type,
+        "skill_hints": skill_hints,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "errors": errors,
+    }
 
 
 async def run_all(fixtures_dir: Path, mode: str) -> dict:
@@ -74,12 +103,32 @@ async def run_all(fixtures_dir: Path, mode: str) -> dict:
         results.append(result)
 
     passed = sum(1 for item in results if item["ok"])
+    parse_passed = sum(1 for item in results if item.get("parse_success"))
     total = len(results)
+    token_cases = [
+        item for item in results if isinstance(item.get("input_tokens"), int)
+    ]
+    total_input_tokens = sum(int(item.get("input_tokens") or 0) for item in token_cases)
+    total_output_tokens = sum(int(item.get("output_tokens") or 0) for item in token_cases)
+    total_cached_input_tokens = sum(
+        int(item.get("cached_input_tokens") or 0) for item in token_cases
+    )
     report = {
         "mode": mode,
         "passed": passed,
+        "parse_passed": parse_passed,
         "total": total,
         "success_rate": round((passed / total) * 100, 2) if total else 0.0,
+        "parse_success_rate": round((parse_passed / total) * 100, 2) if total else 0.0,
+        "token_summary": {
+            "cases_with_usage": len(token_cases),
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "total_cached_input_tokens": total_cached_input_tokens,
+            "avg_input_tokens_per_case": (
+                round(total_input_tokens / len(token_cases), 2) if token_cases else None
+            ),
+        },
         "results": results,
     }
     return report

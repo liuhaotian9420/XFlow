@@ -1,0 +1,5 @@
+{
+  "id": "e2e_smoke_literal_select",
+  "title": "Minimal NL → Codex → one .sql file → dataworks export path",
+  "business_request": "请只写一句 MaxCompute（ODPS）SQL：查询返回恰好一行，两列：id 为 BIGINT 常量 1，label 为 STRING 常量 'ok'。不要 CREATE / DROP / INSERT，不要引用任何业务表，只用字面量 SELECT（例如 SELECT 1 AS id, 'ok' AS label 这种形式）。只输出 SQL，不要解释。"
+}

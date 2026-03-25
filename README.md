@@ -64,13 +64,16 @@ Chat persistence:
 | `CODEX_MOCK` | `true` | Use mock mode when true. |
 | `CODEX_BINARY` | auto | Absolute path to `codex.exe` / `codex`. |
 | `CODEX_CLI_COMMAND` | unset | Optional command/path override for Codex CLI resolution. |
+| `XINFEI_CODEX_BINARY` | unset | Optional absolute path to Xinfei Codex binary (used for fallback resolution). |
+| `XINFEI_CODEX_HOME` | unset | Optional Xinfei install root; backend resolves `<home>/bin/codex(.exe)`. |
+| `XINFEI_CODEX_PREFER` | `false` | Prefer Xinfei binary over `PATH` `codex` when both are available. |
 | `CODEX_MODEL` | unset | Optional model override for `codex exec` (e.g. `gpt-5.4-mini`, `gpt-5.4-nano`). |
 | `CODEX_REASONING_EFFORT` | unset | Optional reasoning effort override (`low`/`medium`/`high`). |
 | `CODEX_THINK_LEVEL` | unset | Alias of `CODEX_REASONING_EFFORT`. |
 | `CODEX_TIMEOUT_SECONDS` | `180` | Timeout for `codex exec`. |
 | `CODEX_ASYNC_SUBPROCESS` | `true` | Use asyncio subprocess path for Codex calls (enables detailed phase timings). |
 | `CODEX_DISABLE_MCP` | `true` | Disable MCP server startup for backend `codex exec` calls (reduces per-call overhead). |
-| `CODEX_MCP_DISABLE_SERVERS` | `notion,linear,figma,playwright` | Comma-separated MCP server names to disable when `CODEX_DISABLE_MCP=true`. |
+| `CODEX_MCP_DISABLE_SERVERS` | `notion,linear,figma,playwright` | Deprecated in current backend path; `CODEX_DISABLE_MCP=true` now forces `mcp_servers={}` to avoid CLI transport-parse failures. |
 | `CODEX_RETRY_COUNT` | `1` | Retry count for plan/revise parse failures. |
 | `CODEX_AUTO_MOCK_THRESHOLD` | `3` | Consecutive real-mode failures before process auto-degrades to mock. |
 | `CODEX_HTTP_TRANSPORT_ONLY` | `true` | Inject Codex config overrides for HTTP/SSE provider. |
@@ -85,7 +88,8 @@ Chat persistence:
 
 Repository skills live under `.agents/skills/*/SKILL.md`.
 - `GET /skills` lists discovered skill metadata.
-- Skill bodies are injected into prompts for planner/chat/reviser flows.
+- Runtime uses Codex native skill discovery/progressive disclosure.
+- Backend prompts only pass short skill hints (for example, `$analysis-planner`) and keep templates minimal.
 
 ## Regression
 

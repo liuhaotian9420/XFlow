@@ -1,4 +1,4 @@
-"""Load Codex-style ``SKILL.md`` files from ``.agents/skills`` for prompt injection."""
+"""Load Codex-style ``SKILL.md`` files from ``.agents/skills`` for discovery and metadata."""
 
 from __future__ import annotations
 

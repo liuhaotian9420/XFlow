@@ -1,0 +1,32 @@
+[
+  {
+    "id": "monitor_screen_daily_current_month",
+    "difficulty": "hard",
+    "truth_path": ".agents/skills/sql-generator/references/sql代码/ads_inloan_loan_monitor_screen_df.sql",
+    "business_request": "帮我出一段 ODPS SQL，用于“放款监控日报（邮件任务）”。要求输出 current_mth 口径下按天的放款监控明细，至少要包含：放款日期、渠道/客群 flag（比如个人API首贷、个人API复贷、个人APP首贷(新)、个人APP复贷、新客总体、老客总体、自营总计等）、日放款金额、日订单数、月累计放款、目标值、每日资产金额。数据取最近一个月（按当前月口径，遇到月初要兼容跨月逻辑），并使用 MAX_PT 获取最新分区。只返回一段可直接落地执行的 SQL。"
+  },
+  {
+    "id": "loan_pass_monitor_with_recent30_reject",
+    "difficulty": "hard",
+    "truth_path": ".agents/skills/sql-generator/references/sql代码/ads_inloan_loan_pass_monitor_df.sql",
+    "business_request": "我需要一段 ODPS SQL 产出“每日资产邮件”的风险通过监控表。请按天（dt）+ 分组（flg）输出：总人数、通过人数、最近30天是否被拒（0/1），并区分 current_mth 和 mthly_summary 两类 date_type。老客部分需要能区分“老客_APP放款”和“老客_APP放款(API首贷)”，新客部分要包含授信通过率（APP/API首贷）以及“新客_APP首贷(API授信)”。要求口径与现网一致：用 MAX_PT，月初要用 date_add(current_date(),-5) 兜底。只返回 SQL，不要解释。"
+  },
+  {
+    "id": "loan_balance_mthly_and_daily",
+    "difficulty": "medium",
+    "truth_path": ".agents/skills/sql-generator/references/sql代码/ads_inloan_loan_balance_mthly_df.sql",
+    "business_request": "请帮我写 ODPS SQL 产出“月度贷余 + 最新一天贷余”的报表表（ads 层）。输出字段包括 data_date、loan_type（区分 API / APP首贷 / APP复贷 / 导流 等）、flag（mthly/daily）、对资贷余(亿)、余额_30/90/180(亿)。月度部分取每月月末（dim_pub_date is_lastday=1），范围从 2023-01-31 到上月末；日度部分取本月截至昨天的每一天（月初兼容）。对资贷余来自 fin_onloan_fee 结合 dim_pub_date；余额来自 repay_user_order / repay_op_user_bill 等口径。只返回一段可执行 SQL。"
+  },
+  {
+    "id": "risk_asset_stat_partitioned",
+    "difficulty": "medium",
+    "truth_path": ".agents/skills/sql-generator/references/sql代码/dws_inloan_loan_risk_stat_df.sql",
+    "business_request": "帮我写一段 ODPS SQL 生成“每日资产放款统计表”，按订单申请日期汇总输出：个人API首贷资产金额、个人API复贷资产金额、个人APP首贷(新)资产金额、个人APP复贷资产金额，并按 pt='${bizdate}' 分区写入。数据来源要基于 inloan_user_order + 授信归因 + 注册渠道等信息，逻辑要能区分 pay_channel=API/APP、loan_flag=首贷/加贷/复贷，并用 MAX_PT 取最新分区。只返回 SQL。"
+  },
+  {
+    "id": "vip_dynamic_income_t0_t60",
+    "difficulty": "hard",
+    "truth_path": ".agents/skills/sql-generator/references/sql代码/xyf_jingying.weekly_analysis_report_vip_dynamic_income_lss.txt",
+    "business_request": "我需要一段 ODPS SQL 产出“动态收入口径（按 vip_order_time 基准）”的表：输出每笔会员订单在 T0/T7/T20/T30/T60 的累积扣得、累积退款、累积净收入。覆盖飞享卡(vip)、飞跃卡(leap)、提额卡(tek) 三类，按 vip_order_time 派生 week/month/week_end/month_end 等日期维度，排除已放款首贷客户（vip_order_time < 首贷放款时间 的要剔除），并关联 dim_pub_date 获取周字段。只返回 SQL，不要解释。"
+  }
+]

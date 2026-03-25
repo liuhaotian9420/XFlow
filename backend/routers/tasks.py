@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import uuid
 from datetime import datetime, timezone
 
+import requests
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
@@ -22,6 +24,7 @@ from backend.execution.engine import run_plan
 from backend.observability import diff_dicts, log_event, save_snapshot
 from backend.profiler.schema_profiler import profile_upload
 from backend.schemas.plan import AnalysisPlan
+from backend.schemas.result import ArtifactPayload
 from backend.schemas.task import TaskError, TaskInput, TaskRecord, TaskStatus
 from backend.storage import CODEX_FAILURE_COUNT, TASK_DATAFRAMES, TASK_SNAPSHOTS, TASKS
 
@@ -313,6 +316,14 @@ async def submit_review(
         default=None,
         description="If set, overrides JSON body use_mock for this request.",
     ),
+    include_demo_artifacts: bool = Query(
+        default=False,
+        description="If true, include demo PNG/HTML artifacts in the result payload (frontend rendering test).",
+    ),
+    demo_png_url: str | None = Query(
+        default=None,
+        description="Optional PNG URL to download for demo artifact (size-controlled).",
+    ),
     model: str | None = Query(
         default=None,
         description="Optional per-request Codex model override (e.g. gpt-5.4-mini).",
@@ -354,6 +365,52 @@ async def submit_review(
                 ),
             )
         record.result = run_plan(df=df, plan=payload.final_plan)
+
+        # Optionally attach demo artifacts for Streamlit rendering verification.
+        if include_demo_artifacts:
+            # A stable, size-controlled random image provider (returns 302 to a real PNG/JPEG).
+            # Use a fixed seed to avoid unexpected large images.
+            url = demo_png_url or f"https://picsum.photos/seed/{task_id[:8]}/640/360"
+            try:
+                resp = requests.get(url, timeout=15)
+                resp.raise_for_status()
+                content = resp.content
+                # Hard cap to avoid bloating payloads.
+                if len(content) <= 200_000:
+                    record.result.artifacts.append(
+                        ArtifactPayload(
+                            name="demo_image",
+                            mime=resp.headers.get("content-type", "image/png"),
+                            data_base64=base64.b64encode(content).decode("ascii"),
+                            display_width=640,
+                        )
+                    )
+                else:
+                    record.result.execution_summary = (
+                        record.result.execution_summary
+                        + f" Demo image skipped (too large: {len(content)} bytes)."
+                    )
+            except Exception as exc:
+                record.result.execution_summary = (
+                    record.result.execution_summary + f" Demo image fetch failed: {exc}."
+                )
+
+            # Simple self-owned HTML snippet to validate HTML rendering.
+            record.result.artifacts.append(
+                ArtifactPayload(
+                    name="demo_html",
+                    mime="text/html",
+                    html=(
+                        "<div style='font-family: ui-sans-serif, system-ui; padding: 12px; border: 1px solid #ddd; "
+                        "border-radius: 10px;'>"
+                        "<h4 style='margin: 0 0 8px 0;'>Demo HTML artifact</h4>"
+                        "<p style='margin: 0;'>If you can see this card, Streamlit HTML rendering is working.</p>"
+                        "</div>"
+                    ),
+                    display_height=120,
+                )
+            )
+
         result_summary = {
             "row_count": len(record.result.table.rows),
             "columns": record.result.table.columns,

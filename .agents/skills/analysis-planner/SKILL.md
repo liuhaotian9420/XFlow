@@ -1,58 +1,39 @@
 ---
 name: analysis-planner
-description: Generate a structured AnalysisPlan JSON from a user question and schema profile. Trigger when the user asks to create or revise a data analysis plan.
+description: Trigger when user asks to create a structured analysis plan from a question plus schema profile.
 ---
 
-You are an analysis planning assistant for tabular data.
+## Watermark
+- Every time this skill is used, overwrite `water.json` in this skill directory.
+- Use `../_common/scripts/write_watermark.py` to write the file.
+- Required JSON shape:
+  - `skill`: `analysis-planner`
+  - `version`: watermark version, default `v1`
+  - `input_files`: input file names/paths used for this run, or `[]`
+  - `actions`: concise completed actions for this run
+- Do this before the final answer for the skill, and overwrite rather than append.
 
-CRITICAL output rules:
+## Goal
+Return a complete AnalysisPlan JSON for tabular analysis tasks.
 
-- Respond with ONE JSON object only.
-- No markdown, no code fences, no explanation before or after the JSON.
-- Use only column names that appear in the schema profile below.
-- "aggregation" must be one of: sum, mean, count, max, min, median.
-- "operator" must be one of: eq, neq, gt, gte, lt, lte, in, not_in, contains.
-- "role" must be one of: time, category, geo.
-- "chart_type" must be one of: line, bar, histogram.
+## Inputs expected
+- User question (intent)
+- Schema profile JSON (columns, row_count, dtypes)
 
-Chart selection (match the user's intent):
+## Output constraints
+- Return exactly one JSON object, no markdown.
+- Use only columns that exist in schema profile.
+- Keep JSON shape: goal, metrics, dimensions, filters, output, ambiguities, confidence.
+- Allowed values:
+  - aggregation: sum, mean, count, max, min, median
+  - operator: eq, neq, gt, gte, lt, lte, in, not_in, contains
+  - role: time, category, geo
+  - chart_type: line, bar, histogram
 
-- Use "line" for time trends: words like 趋势, 变化, 走势, 增长, 按月, 按日, trend, over time.
-- Use "bar" for category comparison: 对比, 比较, 各部门, 各区域, 排名, compare.
-- Use "histogram" when the user asks for 分布, distribution, 频率分布, or per-category share of a single numeric measure (e.g. 各渠道流量分布): set chart_type to "histogram", not "bar".
-- Use "bar" only for explicit side-by-side comparison of metrics across categories (对比/比较), not for 分布 wording.
+## Failure handling
+- If intent is ambiguous, still return best-effort plan and record ambiguity in `ambiguities`.
+- Keep `confidence` aligned with uncertainty.
 
-Filters on date/time columns: use operators gt, gte, lt, lte, eq with concrete values (e.g. ISO dates "2025-01-01") when possible. Do NOT use operator "contains" on date columns with vague Chinese phrases — that usually filters out all rows.
-
-If row_count in the schema is small (under ~20), keep filters minimal so the result is not empty unless the user clearly requires a strict slice.
-
-Set "confidence" between 0.0 and 1.0. List real uncertainties in "ambiguities".
-
-Example of valid output (structure only; adapt columns to the real schema):
-
-```json
-{
-  "goal": "Compare sales by region last quarter",
-  "metrics": [{"column": "amount", "aggregation": "sum", "alias": "amount_sum"}],
-  "dimensions": [
-    {"column": "date", "role": "time"},
-    {"column": "region", "role": "category"}
-  ],
-  "filters": [{"column": "region", "operator": "eq", "value": "华东"}],
-  "output": {"chart_type": "line", "show_table": true},
-  "ambiguities": [{"field": "date", "issue": "Assuming column date is parseable as time"}],
-  "confidence": 0.75
-}
-```
-
-Output JSON must match this shape (field names and types):
-
-- goal: string
-- metrics: array of { column, aggregation (sum|mean|count|max|min|median), alias (string|null) }
-- dimensions: array of { column, role (time|category|geo) }
-- filters: array of { column, operator (eq|neq|gt|gte|lt|lte|in|not_in|contains), value }
-- output: { chart_type (line|bar|histogram), show_table: true }
-- ambiguities: array of { field, issue }
-- confidence: number 0.0–1.0
-
-The user message will include the concrete question and schema profile JSON.
+## Boundaries
+- Do not return prose around JSON.
+- Do not invent columns that are absent from schema.

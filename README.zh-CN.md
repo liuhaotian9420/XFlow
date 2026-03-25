@@ -64,13 +64,16 @@ Chat 持久化：
 | `CODEX_MOCK` | `true` | 为真时走 mock。 |
 | `CODEX_BINARY` | 自动 | `codex.exe` / `codex` 绝对路径。 |
 | `CODEX_CLI_COMMAND` | 未设置 | 可选命令/路径覆盖。 |
+| `XINFEI_CODEX_BINARY` | 未设置 | 可选信飞 Codex 绝对路径（用于回退解析）。 |
+| `XINFEI_CODEX_HOME` | 未设置 | 可选信飞安装根目录，后端会解析 `<home>/bin/codex(.exe)`。 |
+| `XINFEI_CODEX_PREFER` | `false` | 当 PATH 与 Xinfei 同时可用时，是否优先使用 Xinfei。 |
 | `CODEX_MODEL` | 未设置 | 可选模型覆盖（如 `gpt-5.4-mini`、`gpt-5.4-nano`）。 |
 | `CODEX_REASONING_EFFORT` | 未设置 | 可选推理强度覆盖（`low`/`medium`/`high`）。 |
 | `CODEX_THINK_LEVEL` | 未设置 | `CODEX_REASONING_EFFORT` 的别名。 |
 | `CODEX_TIMEOUT_SECONDS` | `180` | `codex exec` 超时秒数。 |
 | `CODEX_ASYNC_SUBPROCESS` | `true` | 使用 asyncio 子进程路径调用 Codex（可输出更细粒度时间拆解）。 |
 | `CODEX_DISABLE_MCP` | `true` | 是否在后端 `codex exec` 调用中禁用 MCP 启动（可降低每次调用开销）。 |
-| `CODEX_MCP_DISABLE_SERVERS` | `notion,linear,figma,playwright` | 当 `CODEX_DISABLE_MCP=true` 时要禁用的 MCP 名称列表（逗号分隔）。 |
+| `CODEX_MCP_DISABLE_SERVERS` | `notion,linear,figma,playwright` | 当前后端路径已弃用该项；`CODEX_DISABLE_MCP=true` 会直接注入 `mcp_servers={}`，以规避 CLI 的 transport 解析报错。 |
 | `CODEX_RETRY_COUNT` | `1` | 计划/改计划解析失败时重试次数。 |
 | `CODEX_AUTO_MOCK_THRESHOLD` | `3` | 真实模式连续失败达到阈值后自动降级 mock。 |
 | `CODEX_HTTP_TRANSPORT_ONLY` | `true` | 注入 Codex 的 HTTP/SSE 配置覆盖。 |
@@ -85,7 +88,8 @@ Chat 持久化：
 
 仓库技能位于 `.agents/skills/*/SKILL.md`。
 - `GET /skills` 可查看已发现的技能元数据。
-- 规划/对话/改计划提示词会注入技能正文。
+- 运行时依赖 Codex 原生 skills discovery/progressive disclosure。
+- 规划/对话/改计划提示词仅传短显式 hint（例如 `$analysis-planner`），不再注入技能全文。
 
 ## 回归测试
 

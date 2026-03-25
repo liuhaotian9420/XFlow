@@ -1,0 +1,5 @@
+{
+  "id": "full_integration_smoke",
+  "title": "One-go Codex: sql-generator → dataworks (DuckDB) → scorecardpy",
+  "business_request": "编写单条 ODPS SQL：从表 xyf_bi_dev.bi_app_zhuanhua_tixian_new_uid 取样最多 100 行（LIMIT 100；分区按现网习惯使用 MAX_PT 或 ${bizdate}）。SELECT 必须包含 entity_id（用户或主键类字段映射）与 target（0/1；若无现成字段则用 CASE 从业务列构造并在 SQL 注释写明规则）；其余列保留作 scorecard 特征。导出到本地 DuckDB 后可用 scorecardpy 以 --target target、--id-col entity_id 跑通建模与 export_breaks。"
+}
