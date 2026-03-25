@@ -289,6 +289,26 @@ def fit_pipeline(df: pd.DataFrame, cfg: RunConfig) -> dict:
     }
 
 
+def _to_jsonable(value: object) -> object:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:
+            pass
+    return str(value)
+
+
 def save_artifacts(result: dict, cfg: RunConfig) -> None:
     os.makedirs(cfg.out_dir, exist_ok=True)
 
@@ -311,6 +331,13 @@ def save_artifacts(result: dict, cfg: RunConfig) -> None:
     }
     with open(os.path.join(cfg.out_dir, "run_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    metrics = {
+        "train": _to_jsonable(result.get("eva_train", {})),
+        "test": _to_jsonable(result.get("eva_test", {})),
+    }
+    with open(os.path.join(cfg.out_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
 
     result["scored_test"].to_csv(
         os.path.join(cfg.out_dir, "scored_test.csv"),

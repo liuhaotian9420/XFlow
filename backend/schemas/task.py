@@ -24,6 +24,17 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 
+class ReviewType(str, Enum):
+    CONFIRMATION = "confirmation"
+    SUGGESTION = "suggestion"
+
+
+class ReviewState(str, Enum):
+    PENDING = "pending"
+    RESOLVED = "resolved"
+    SUPERSEDED = "superseded"
+
+
 class TaskInput(BaseModel):
     question: str
     filename: str
@@ -37,6 +48,20 @@ class TaskError(BaseModel):
     detail: str | None = None
 
 
+class TaskReview(BaseModel):
+    review_id: str
+    review_type: ReviewType
+    state: ReviewState = ReviewState.PENDING
+    title: str
+    message: str
+    options: list[str] = Field(default_factory=list)
+    suggested_plan: AnalysisPlan | None = None
+    user_choice: str | None = None
+    user_text: str | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+    resolved_at: datetime | None = None
+
+
 class TaskRecord(BaseModel):
     task_id: str
     status: TaskStatus = TaskStatus.CREATED
@@ -45,6 +70,8 @@ class TaskRecord(BaseModel):
     input: TaskInput
     plan: AnalysisPlan | None = None
     final_plan: AnalysisPlan | None = None
+    pending_review: TaskReview | None = None
+    review_history: list[TaskReview] = Field(default_factory=list)
     result: ResultPayload | None = None
     error: TaskError | None = None
 

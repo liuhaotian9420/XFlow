@@ -39,6 +39,7 @@ ERROR_KIND_CHAT = "chat"
 ERROR_KIND_CREATE_TASK = "create_task"
 ERROR_KIND_CONFIRM_TASK = "confirm_task"
 ERROR_KIND_REVISE_PLAN = "revise_plan"
+ERROR_KIND_REVIEW_RESPOND = "review_respond"
 
 # Max user "turns" (each user text message starts one) fully expanded in the main column; older rows go in an expander.
 MAX_VISIBLE_CHAT_TURNS = 40
@@ -177,6 +178,19 @@ def _pending_plan_task_id() -> str | None:
     return None
 
 
+def _pending_review_task_id() -> str | None:
+    """Task id of the latest unresolved review_request card."""
+    for m in reversed(st.session_state.messages):
+        if m.get("type") != "review_request":
+            continue
+        if bool(m.get("resolved")):
+            continue
+        tid = m.get("task_id")
+        if tid:
+            return str(tid)
+    return None
+
+
 def _chat_history_upto(before_index: int) -> list[dict[str, str]]:
     """Build {role, content} history for POST /chat from prior transcript turns."""
     def _sanitize_assistant_content(text: str) -> str:
@@ -273,14 +287,36 @@ def _post_task_bytes(
     return response.json()
 
 
-def _post_review(task_id: str, final_plan: dict[str, Any]) -> dict[str, Any]:
+def _post_run_task(task_id: str, plan: dict[str, Any] | None) -> dict[str, Any]:
     params = _codex_mock_query_params()
     if bool(st.session_state.get("include_demo_artifacts", False)):
         params["include_demo_artifacts"] = "true"
     response = requests.post(
-        _api_url(f"/tasks/{task_id}/review"),
-        json={"final_plan": final_plan},
+        _api_url(f"/tasks/{task_id}/run"),
+        json={"plan": plan} if plan is not None else {},
         params=params,
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _post_review_respond(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    response = requests.post(
+        _api_url(f"/tasks/{task_id}/review/respond"),
+        json=payload,
+        params=_codex_mock_query_params(),
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _post_create_review_request(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    response = requests.post(
+        _api_url(f"/tasks/{task_id}/review"),
+        json=payload,
+        params=_codex_mock_query_params(),
         timeout=120,
     )
     response.raise_for_status()
@@ -488,6 +524,47 @@ def _append_task_history(task_id: str, question: str) -> None:
     st.session_state.task_history = hist[-20:]
 
 
+def _append_review_request_message(task_id: str, review: dict[str, Any]) -> None:
+    """Append one pending review_request message if not already present."""
+    review_id = str(review.get("review_id") or "").strip()
+    if not review_id:
+        return
+    for m in reversed(st.session_state.messages):
+        if m.get("type") != "review_request":
+            continue
+        if str(m.get("review_id") or "").strip() == review_id:
+            return
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "type": "review_request",
+            "task_id": task_id,
+            "review_id": review_id,
+            "review_type": str(review.get("review_type") or "").strip(),
+            "title": str(review.get("title") or "").strip(),
+            "message": str(review.get("message") or "").strip(),
+            "options": list(review.get("options") or []),
+            "resolved": False,
+        }
+    )
+
+
+def _ensure_confirmation_review(task_id: str) -> None:
+    """Create one pending confirmation review on backend and mirror it in chat."""
+    rec = _post_create_review_request(
+        task_id,
+        {
+            "review_type": "confirmation",
+            "title": "Confirm Execution",
+            "message": "Review the current plan. Confirm to run, or type feedback to revise the plan first.",
+            "options": ["Confirm and run"],
+        },
+    )
+    pending = rec.get("pending_review")
+    if isinstance(pending, dict) and str(pending.get("state") or "").lower() == "pending":
+        _append_review_request_message(task_id, pending)
+
+
 def _restore_chat_messages_from_turns(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     restored: list[dict[str, Any]] = []
     for turn in turns:
@@ -566,6 +643,25 @@ def _enqueue_revise_plan(task_id: str, instruction: str) -> None:
     )
 
 
+def _enqueue_review_respond(
+    task_id: str,
+    *,
+    user_text: str | None = None,
+    choice: str | None = None,
+) -> None:
+    """Queue response for pending task review; user_text has higher priority server-side."""
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "type": "thinking",
+            "action": "respond_review",
+            "task_id": task_id,
+            "user_text": (user_text or "").strip(),
+            "choice": (choice or "").strip(),
+        }
+    )
+
+
 def _execute_create_task(msg: dict[str, Any], msg_index: int) -> None:
     """Called during render when a 'thinking/create_task' message is encountered."""
     question = msg["question"]
@@ -590,6 +686,11 @@ def _execute_create_task(msg: dict[str, Any], msg_index: int) -> None:
             "task_id": tid,
             "plan": plan,
         }
+        try:
+            _ensure_confirmation_review(tid)
+        except requests.RequestException:
+            # Plan can still be shown even if review creation fails.
+            pass
         st.session_state.active_task_id = tid
         _append_task_history(tid, question)
         st.session_state.task_history_cache = []
@@ -615,11 +716,21 @@ def _execute_create_task(msg: dict[str, Any], msg_index: int) -> None:
 def _execute_confirm_task(msg: dict[str, Any], msg_index: int) -> None:
     """Called during render when a 'thinking/confirm_task' message is encountered."""
     task_id = msg["task_id"]
-    final_plan = msg["final_plan"]
+    final_plan = msg.get("final_plan")
     try:
         with st.spinner("Running analysis…"):
-            rec = _post_review(task_id, final_plan)
+            rec = _post_run_task(task_id, final_plan)
         st.session_state[f"review_done_{task_id}"] = True
+        for j, m in enumerate(st.session_state.messages):
+            if (
+                m.get("type") == "review_request"
+                and str(m.get("task_id")) == task_id
+                and not bool(m.get("resolved"))
+            ):
+                updated = dict(m)
+                updated["resolved"] = True
+                updated["resolution"] = "confirm_and_run"
+                st.session_state.messages[j] = updated
         res = rec.get("result")
         if res is not None:
             st.session_state.messages[msg_index] = {
@@ -639,7 +750,7 @@ def _execute_confirm_task(msg: dict[str, Any], msg_index: int) -> None:
             st.session_state.messages[msg_index] = {
                 "role": "assistant",
                 "type": "text",
-                "content": f"Review submitted but no result on record (status={rec.get('status')}).",
+                "content": f"Run submitted but no result on record yet (status={rec.get('status')}).",
             }
     except requests.RequestException as exc:
         st.session_state.messages[msg_index] = _assistant_error_dict(
@@ -785,6 +896,90 @@ def _execute_revise_plan(msg: dict[str, Any], msg_index: int) -> None:
     st.rerun()
 
 
+def _execute_review_respond(msg: dict[str, Any], msg_index: int) -> None:
+    """POST /tasks/{id}/review/respond and apply returned task state into chat cards."""
+    task_id = str(msg["task_id"])
+    user_text = str(msg.get("user_text") or "").strip()
+    choice = str(msg.get("choice") or "").strip()
+    payload: dict[str, Any] = {}
+    if user_text:
+        payload["user_text"] = user_text
+    if choice:
+        payload["choice"] = choice
+    if not payload:
+        st.session_state.messages[msg_index] = {
+            "role": "assistant",
+            "type": "text",
+            "content": "No review response was sent.",
+        }
+        st.rerun()
+        return
+    try:
+        with st.spinner("Submitting review response…"):
+            rec = _post_review_respond(task_id, payload)
+        for j, m in enumerate(st.session_state.messages):
+            if (
+                m.get("type") == "review_request"
+                and str(m.get("task_id")) == task_id
+                and not bool(m.get("resolved"))
+            ):
+                updated = dict(m)
+                updated["resolved"] = True
+                updated["resolution"] = user_text or choice or "resolved"
+                st.session_state.messages[j] = updated
+                break
+        plan = rec.get("plan")
+        if isinstance(plan, dict):
+            suffix = f"_{task_id}"
+            for k in list(st.session_state.keys()):
+                if isinstance(k, str) and k.startswith("plan_json_") and k.endswith(suffix):
+                    st.session_state.pop(k, None)
+            plan_card_updated = False
+            for j, m in enumerate(st.session_state.messages):
+                if m.get("type") == "plan_review" and str(m.get("task_id")) == task_id:
+                    st.session_state.messages[j] = {
+                        "role": "assistant",
+                        "type": "plan_review",
+                        "task_id": task_id,
+                        "plan": plan,
+                    }
+                    plan_card_updated = True
+                    break
+            if not plan_card_updated:
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "type": "plan_review",
+                        "task_id": task_id,
+                        "plan": plan,
+                    }
+                )
+        pending = rec.get("pending_review")
+        if isinstance(pending, dict) and str(pending.get("state") or "").lower() == "pending":
+            _append_review_request_message(task_id, pending)
+        elif user_text:
+            try:
+                _ensure_confirmation_review(task_id)
+            except requests.RequestException:
+                pass
+        st.session_state.messages[msg_index] = {
+            "role": "assistant",
+            "type": "text",
+            "content": (
+                "你的文本反馈已应用到计划。"
+                if user_text
+                else "已记录你的选择。"
+            ),
+        }
+    except requests.RequestException as exc:
+        st.session_state.messages[msg_index] = _assistant_error_dict(
+            "Could not respond to review",
+            _requests_error_message(exc),
+            kind=ERROR_KIND_REVIEW_RESPOND,
+        )
+    st.rerun()
+
+
 def _format_ts_for_sidebar(iso: str | None) -> str:
     """Format API ISO timestamps for a weak sidebar caption: output MM-DD HH:MM (local time when tz-aware)."""
     if iso is None or not str(iso).strip():
@@ -838,6 +1033,9 @@ def _render_chat_message(i: int, msg: dict[str, Any]) -> None:
             elif action == "revise_plan":
                 st.markdown("Updating the plan…")
                 _execute_revise_plan(msg, i)
+            elif action == "respond_review":
+                st.markdown("Applying your review response…")
+                _execute_review_respond(msg, i)
             else:
                 st.markdown("Processing…")
         return
@@ -864,12 +1062,51 @@ def _render_chat_message(i: int, msg: dict[str, Any]) -> None:
                     if meta_parts:
                         st.caption(" | ".join(meta_parts))
                     st.code(debug_prompt, language="markdown")
+        elif mtype == "review_request":
+            task_id = str(msg.get("task_id") or "")
+            review_id = str(msg.get("review_id") or "")
+            title = str(msg.get("title") or "Review")
+            body = str(msg.get("message") or "")
+            options = [str(x).strip() for x in (msg.get("options") or []) if str(x).strip()]
+            resolved = bool(msg.get("resolved"))
+            review_type = str(msg.get("review_type") or "").strip().lower()
+            st.markdown(f"**{title}**")
+            if body:
+                st.markdown(body)
+            if review_type:
+                st.caption(f"type: `{review_type}`")
+            if resolved:
+                st.success(f"Handled: {str(msg.get('resolution') or 'resolved')}")
+            elif review_type == "confirmation":
+                if st.button(
+                    "Confirm and run",
+                    type="primary",
+                    key=f"review_confirm_run_{i}_{task_id}_{review_id}",
+                ):
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "type": "thinking",
+                            "action": "confirm_task",
+                            "task_id": task_id,
+                            "final_plan": None,
+                        }
+                    )
+                    st.rerun()
+            elif options:
+                cols = st.columns(min(3, len(options)))
+                for idx, opt in enumerate(options):
+                    with cols[idx % len(cols)]:
+                        if st.button(opt, key=f"review_opt_{i}_{task_id}_{review_id}_{idx}"):
+                            _enqueue_review_respond(task_id, choice=opt)
+                            st.rerun()
+            st.caption("直接输入文本优先级更高，会覆盖按钮选择。")
         elif mtype == "plan_review":
             task_id = msg["task_id"]
             plan = msg["plan"]
             st.markdown(
-                "Here is the proposed **analysis plan**. Review the JSON if needed, then confirm to run. "
-                "While this card is open, you can **type revision feedback in chat** (no `/task` prefix) to update the plan."
+                "Here is the proposed **analysis plan**. This is an informational message; "
+                "execution decisions are handled in the review card."
             )
             _render_plan_tables(plan)
 
@@ -897,32 +1134,9 @@ def _render_chat_message(i: int, msg: dict[str, Any]) -> None:
 
             done_key = f"review_done_{task_id}"
             if st.session_state.get(done_key):
-                st.success("Plan submitted — scroll down for the result card.")
+                st.success("Plan executed — see the result card below.")
             else:
-                b1, b2 = st.columns(2)
-                with b1:
-                    if st.button(
-                        "Confirm and run",
-                        type="primary",
-                        key=f"confirm_{i}_{task_id}",
-                    ):
-                        try:
-                            final_plan = json.loads(st.session_state[plan_key])
-                        except json.JSONDecodeError as exc:
-                            st.error(str(exc))
-                        else:
-                            st.session_state.messages.append(
-                                {
-                                    "role": "assistant",
-                                    "type": "thinking",
-                                    "action": "confirm_task",
-                                    "task_id": task_id,
-                                    "final_plan": final_plan,
-                                }
-                            )
-                            st.rerun()
-                with b2:
-                    st.caption("Edit the JSON in the expander above before confirming.")
+                st.caption("Tip: use the review card below to confirm run or provide feedback.")
 
         elif mtype == "result":
             tid = msg["task_id"]
@@ -1132,13 +1346,17 @@ with st.sidebar:
             with c1:
                 if st.button("Refresh", key=f"hist_ref_{tid}"):
                     try:
+                        rec = _get_task(tid)
                         st.session_state.messages.append(
                             {
                                 "role": "assistant",
                                 "type": "text",
-                                "content": f"Task `{tid}` status: `{_get_task(tid).get('status')}`",
+                                "content": f"Task `{tid}` status: `{rec.get('status')}`",
                             }
                         )
+                        pending = rec.get("pending_review")
+                        if isinstance(pending, dict) and str(pending.get("state") or "").lower() == "pending":
+                            _append_review_request_message(tid, pending)
                         st.rerun()
                     except requests.RequestException as exc:
                         st.error(_requests_error_message(exc))
@@ -1253,9 +1471,9 @@ with tab_chat:
                     st.session_state.mode = "task"
                     _enqueue_task(task_body)
             elif st.session_state.get("mode") == "task":
-                pending_tid = _pending_plan_task_id()
-                if pending_tid is not None:
-                    _enqueue_revise_plan(pending_tid, text)
+                pending_review_tid = _pending_review_task_id()
+                if pending_review_tid is not None:
+                    _enqueue_review_respond(pending_review_tid, user_text=text)
                 else:
                     st.session_state.mode = "chat"
                     _enqueue_chat(text)

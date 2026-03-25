@@ -8,7 +8,7 @@ from .plan import (
     FilterOperator,
 )
 from .result import ResultPayload
-from .task import TaskRecord, TaskStatus
+from .task import ReviewState, ReviewType, TaskRecord, TaskReview, TaskStatus
 
 __all__ = [
     "Aggregation",
@@ -17,7 +17,10 @@ __all__ = [
     "DimensionRole",
     "FilterOperator",
     "ResultPayload",
+    "ReviewState",
+    "ReviewType",
     "TaskRecord",
+    "TaskReview",
     "TaskStatus",
 ]
 

@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import re
 import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +37,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CASE = REPO_ROOT / "tests" / "full_itegration_case.json"
 
 _SQL_FENCE_RE = re.compile(r"```sql\s*\n(.*?)\n```", re.IGNORECASE | re.DOTALL)
+
+
+def _log(msg: str, *, file=sys.stdout) -> None:
+    """Print one line prefixed with a local timezone-aware ISO timestamp."""
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(f"[{ts}] {msg}", file=file, flush=True)
 
 
 def _load_case(path: Path) -> tuple[str, str]:
@@ -177,6 +184,20 @@ def main() -> int:
         help="Use Codex `--dangerously-bypass-approvals-and-sandbox` (EXTREMELY DANGEROUS).",
     )
     parser.add_argument(
+        "--codex-disable-mcp",
+        action="store_true",
+        default=True,
+        help=(
+            "Disable external MCP servers (notion/linear/figma) to avoid OAuth stalls "
+            "during unattended E2E runs. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--codex-enable-mcp",
+        action="store_true",
+        help="Override and keep MCP servers enabled.",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="Exit 2 if JSONL heuristics do not look like a full three-skill chain",
@@ -210,11 +231,19 @@ def main() -> int:
 
     case_id, business_request = _load_case(Path(args.case_json))
     prompt = build_full_integration_onego_prompt(business_request=business_request, layout=layout)
+    disable_mcp = bool(args.codex_disable_mcp and not args.codex_enable_mcp)
+    codex_config_overrides: list[str] = []
+    if disable_mcp:
+        codex_config_overrides = [
+            "mcp_servers.notion.enabled=false",
+            "mcp_servers.linear.enabled=false",
+            "mcp_servers.figma.enabled=false",
+        ]
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[one-go] case={case_id} → Codex (timeout={args.timeout}s)…", flush=True)
+    _log(f"[one-go] case={case_id} → starting Codex (timeout={args.timeout}s)")
     res = run_codex_json_stream_raw_prompt(
         repo_root=REPO_ROOT,
         run_id=case_id,
@@ -226,6 +255,10 @@ def main() -> int:
         sandbox_mode=str(args.codex_sandbox or "").strip() or None,
         approval_policy=str(args.codex_approvals or "").strip() or None,
         bypass_sandbox=bool(args.codex_bypass_sandbox),
+        codex_config_overrides=codex_config_overrides,
+    )
+    _log(
+        f"[one-go] Codex finished (exit={res.returncode}, elapsed_s={res.elapsed_s:.1f})",
     )
 
     ev = analyze_full_integration_onego_jsonl(res.jsonl_text)
@@ -234,6 +267,7 @@ def main() -> int:
         "codex_exit": res.returncode,
         "elapsed_s": res.elapsed_s,
         "codex_argv": getattr(res, "argv", None),
+        "codex_config_overrides": codex_config_overrides,
         "layout": {
             "duckdb_path_rel": layout.duckdb_path_rel,
             "duckdb_table": layout.duckdb_table,
@@ -257,16 +291,19 @@ def main() -> int:
     }
 
     if res.returncode != 0:
+        _log("[one-go] Codex stderr:", file=sys.stderr)
         print(res.stderr, file=sys.stderr)
 
     report_path = out_dir / f"{case_id}_onego_report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    _log("[one-go] evidence (JSON):")
     print(json.dumps(report["evidence"], ensure_ascii=False, indent=2), flush=True)
-    print(f"[one-go] Report: {report_path}", flush=True)
+    _log(f"[one-go] Report written: {report_path}")
 
     verify_ok = True
     verify_notes: list[str] = []
     if args.verify_after:
+        _log("[one-go] Verifying artifacts…")
         verify_ok, verify_notes = _verify_artifacts(paths, layout.duckdb_table)
         if args.host_exec_after and not verify_ok:
             sql_path_guess = None
@@ -276,12 +313,14 @@ def main() -> int:
                 sql_path_guess = paths["sql_workdir"] / "full_integration_onego_extracted.sql"
                 sql_path_guess.write_text(extracted, encoding="utf-8", newline="\n")
                 try:
+                    _log("[host-exec] Step 2: run_sql_export.py …")
                     _run_step2_dataworks_export(
                         sql_path=sql_path_guess,
                         excel_dir=paths["excel_dir"],
                         duckdb_path=paths["duckdb"],
                         duckdb_table=layout.duckdb_table,
                     )
+                    _log("[host-exec] Step 3: run_scorecardpy.py + export_breaks.py …")
                     _run_step3_scorecardpy(
                         duckdb_path=paths["duckdb"],
                         duckdb_table=layout.duckdb_table,
@@ -298,22 +337,25 @@ def main() -> int:
         report["verify"] = {"ok": verify_ok, "notes": verify_notes}
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         for line in verify_notes:
-            print(f"  [verify] {line}", flush=True)
+            _log(f"  [verify] {line}")
 
     msg = res.last_message.strip()
-    print("\n--- last message (excerpt) ---", flush=True)
+    _log("--- last message (excerpt) ---")
     print((msg[:3000] + "\n…") if len(msg) > 3000 else msg or "(empty)", flush=True)
 
     if res.returncode != 0:
         return int(res.returncode if res.returncode <= 125 else 125)
     if args.strict and not ev.looks_like_full_chain:
-        print("[strict] Heuristic: expected sql-generator → dataworks → scorecardpy in JSONL.", file=sys.stderr)
+        _log(
+            "[strict] Heuristic: expected sql-generator → dataworks → scorecardpy in JSONL.",
+            file=sys.stderr,
+        )
         return 2
     if args.verify_after and not verify_ok:
-        print("[verify] Artifacts missing or empty.", file=sys.stderr)
+        _log("[verify] Artifacts missing or empty.", file=sys.stderr)
         return 3
 
-    print("[one-go] OK", flush=True)
+    _log("[one-go] OK")
     return 0
 
 
