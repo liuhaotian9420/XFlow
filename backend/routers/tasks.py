@@ -7,6 +7,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import requests
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -25,7 +26,10 @@ from backend.execution.engine import run_plan
 from backend.execution.skill_result_adapter import enrich_result_with_skill_outputs
 from backend.observability import ARTIFACT_DIR, ROOT_DIR, diff_dicts, log_event, save_snapshot
 from backend.profiler.schema_profiler import profile_upload
-from backend.schemas.plan import AnalysisPlan
+from backend.runtime_config import default_use_mock
+from backend.runtime_timeout import resolve_timeout_seconds
+from backend.planning.run_guard import assert_plan_runnable_or_400
+from backend.schemas.plan import AnalysisPlan, PlanCompletenessStatus, PlanRecommendedAction
 from backend.schemas.result import ArtifactPayload
 from backend.schemas.task import (
     ReviewState,
@@ -39,13 +43,16 @@ from backend.schemas.task import (
 from backend.storage import CODEX_FAILURE_COUNT, TASK_DATAFRAMES, TASK_SNAPSHOTS, TASKS
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+ANALYSIS_PLANNER_WATERMARK = (
+    ROOT_DIR / ".agents" / "skills" / "analysis-planner" / "water.json"
+)
 
 
 def _effective_use_mock(explicit: bool | None) -> bool:
     """Per-request override; if omitted, follow process env CODEX_MOCK (default true)."""
     if explicit is not None:
         return explicit
-    return os.getenv("CODEX_MOCK", "true").lower() == "true"
+    return default_use_mock()
 
 
 def _effective_reasoning_effort(
@@ -54,6 +61,60 @@ def _effective_reasoning_effort(
 ) -> str | None:
     value = (reasoning_effort or "").strip() or (think_level or "").strip()
     return value or None
+
+
+def _extract_raw_skill_plan(adapter: Any, plan: AnalysisPlan) -> dict[str, Any] | None:
+    raw = getattr(adapter, "last_raw_skill_plan", None)
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(plan.raw_skill_plan, dict):
+        return plan.raw_skill_plan
+    return None
+
+
+def _observe_planner_watermark(task_id: str) -> None:
+    if not ANALYSIS_PLANNER_WATERMARK.is_file():
+        log_event(
+            task_id,
+            "plan",
+            "skill_watermark_missing_or_stale",
+            {"path": str(ANALYSIS_PLANNER_WATERMARK), "reason": "missing"},
+        )
+        return
+    try:
+        mtime = ANALYSIS_PLANNER_WATERMARK.stat().st_mtime
+        log_event(
+            task_id,
+            "plan",
+            "skill_watermark_observed",
+            {"path": str(ANALYSIS_PLANNER_WATERMARK), "mtime": mtime},
+        )
+    except OSError as exc:
+        log_event(
+            task_id,
+            "plan",
+            "skill_watermark_missing_or_stale",
+            {"path": str(ANALYSIS_PLANNER_WATERMARK), "reason": str(exc)},
+        )
+
+
+def _save_plan_compat_snapshots(
+    task_id: str,
+    *,
+    plan: AnalysisPlan,
+    raw_skill_plan: dict[str, Any] | None,
+) -> None:
+    save_snapshot(task_id, "plan", plan.model_dump())
+    save_snapshot(task_id, "plan_normalized", plan.model_dump())
+    if raw_skill_plan is not None:
+        save_snapshot(task_id, "plan_raw_skill", raw_skill_plan)
+    mapping_report = {
+        "raw_skill_present": raw_skill_plan is not None,
+        "chart_type": plan.output.chart_type.value,
+        "completeness_status": plan.completeness.status.value,
+        "recommended_action": plan.completeness.recommended_action.value,
+    }
+    save_snapshot(task_id, "plan_mapping_report", mapping_report)
 
 
 class ReviewRequest(BaseModel):
@@ -91,6 +152,7 @@ class CreateTaskResponse(BaseModel):
     task_id: str
     status: TaskStatus
     plan: AnalysisPlan
+    pending_review: TaskReview | None = None
 
 
 class TaskHistoryItem(BaseModel):
@@ -122,6 +184,94 @@ def _get_task_or_404(task_id: str) -> TaskRecord:
     return persisted
 
 
+def _plan_completeness_status(plan: AnalysisPlan | None) -> str:
+    if plan is None:
+        return PlanCompletenessStatus.COMPLETE.value
+    completeness = getattr(plan, "completeness", None)
+    if completeness is None:
+        return PlanCompletenessStatus.COMPLETE.value
+    status = getattr(completeness, "status", PlanCompletenessStatus.COMPLETE)
+    return status.value if hasattr(status, "value") else str(status)
+
+
+def _plan_recommended_action(plan: AnalysisPlan | None) -> str:
+    if plan is None:
+        return PlanRecommendedAction.CONFIRM.value
+    completeness = getattr(plan, "completeness", None)
+    if completeness is None:
+        return PlanRecommendedAction.CONFIRM.value
+    action = getattr(completeness, "recommended_action", PlanRecommendedAction.CONFIRM)
+    return action.value if hasattr(action, "value") else str(action)
+
+
+def _maybe_attach_completeness_review(
+    record: TaskRecord,
+    *,
+    reason: str = "create_task",
+) -> bool:
+    """Attach a suggestion review when plan is not complete for autonomous run."""
+    plan = record.plan
+    if plan is None:
+        return False
+    status = _plan_completeness_status(plan)
+    if status == PlanCompletenessStatus.COMPLETE.value:
+        return False
+
+    if record.pending_review is not None and record.pending_review.state == ReviewState.PENDING:
+        record.pending_review.state = ReviewState.SUPERSEDED
+        record.pending_review.resolved_at = datetime.now(timezone.utc)
+        record.review_history.append(record.pending_review)
+
+    comp = plan.completeness
+    message_lines = [comp.rationale or "Plan requires extra exploration before execution."]
+    if comp.open_questions:
+        message_lines.append("Open questions:")
+        for q in comp.open_questions[:5]:
+            blocker = " [blocking]" if q.blocking else ""
+            message_lines.append(f"- {q.question}{blocker}")
+    if comp.exploration_tasks:
+        message_lines.append("Exploration tasks:")
+        for t in comp.exploration_tasks[:5]:
+            message_lines.append(f"- {t.goal}")
+    action = _plan_recommended_action(plan)
+    if action == PlanRecommendedAction.CLARIFY.value:
+        message_lines.append(
+            "Clarify missing information before execution, or continue with risk if you accept the gaps."
+        )
+    elif action == PlanRecommendedAction.REVISE_REQUIRED.value:
+        message_lines.append(
+            "Revise the plan first, or continue with explicit risk acceptance if needed."
+        )
+    else:
+        message_lines.append("Confirm to run, or provide feedback to revise the plan first.")
+
+    record.pending_review = TaskReview(
+        review_id=str(uuid.uuid4()),
+        review_type=ReviewType.SUGGESTION,
+        title=f"Plan completeness: {status}",
+        message="\n".join(message_lines),
+        options=[],
+        suggested_plan=plan,
+    )
+    record.status = TaskStatus.REVIEWING
+    record.updated_at = datetime.now(timezone.utc)
+    log_event(
+        record.task_id,
+        "plan",
+        "completeness_review_created",
+        {
+            "status": status,
+            "reason": reason,
+            "score": plan.completeness.score,
+        },
+    )
+    return True
+
+
+def _assert_plan_runnable_or_400(plan: AnalysisPlan) -> None:
+    assert_plan_runnable_or_400(plan)
+
+
 async def _revise_record_plan_with_instruction(
     *,
     task_id: str,
@@ -131,6 +281,7 @@ async def _revise_record_plan_with_instruction(
     model: str | None,
     reasoning_effort: str | None,
     think_level: str | None,
+    timeout_seconds: int | None,
 ) -> None:
     snapshots = TASK_SNAPSHOTS.get(task_id) or {}
     schema_profile = snapshots.get("schema_profile")
@@ -147,6 +298,7 @@ async def _revise_record_plan_with_instruction(
         use_mock_flag,
         model=model,
         reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+        timeout_seconds=timeout_seconds,
     )
     try:
         record.plan = await adapter.revise_plan(
@@ -180,6 +332,13 @@ async def _revise_record_plan_with_instruction(
             "review_user_text_revise_fallback",
             {"error_type": "codex_error", "error": str(exc)},
         )
+    attached = _maybe_attach_completeness_review(
+        record,
+        reason="review_user_text_revise",
+    )
+    if not attached:
+        record.status = TaskStatus.PLANNED
+        record.updated_at = datetime.now(timezone.utc)
     _persist_task(record)
     save_snapshot(task_id, "plan", record.plan.model_dump())
 
@@ -196,6 +355,7 @@ async def _run_task_with_plan(
     model: str | None,
     reasoning_effort: str | None,
     think_level: str | None,
+    timeout_seconds: int | None,
 ) -> TaskRecord:
     record.final_plan = plan
     if record.pending_review is not None and record.pending_review.state == ReviewState.PENDING:
@@ -289,6 +449,7 @@ async def _run_task_with_plan(
             use_mock_flag,
             model=model,
             reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+            timeout_seconds=timeout_seconds,
         )
         try:
             summary_text = await adapter.generate_summary(
@@ -394,20 +555,41 @@ async def create_task(
         default=None,
         description="Alias of reasoning_effort.",
     ),
+    timeout_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        le=3600,
+        description="Optional per-request Codex subprocess timeout in seconds.",
+    ),
+    auto_timeout: bool = Query(
+        default=False,
+        alias="autoTimeout",
+        description="If true, ignore timeout_seconds and estimate timeout from historical Codex runtimes.",
+    ),
 ) -> CreateTaskResponse:
     task_id = str(uuid.uuid4())
     df, schema_profile = profile_upload(file)
     explicit = use_mock
     use_mock_flag = _effective_use_mock(explicit)
+    effective_timeout_seconds = resolve_timeout_seconds(
+        auto_timeout=auto_timeout,
+        explicit_timeout_seconds=timeout_seconds,
+        route_kind="task_plan",
+        model=model,
+        reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+        env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+    )
     adapter = get_provider(
         use_mock_flag,
         model=model,
         reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+        timeout_seconds=effective_timeout_seconds,
     )
     try:
         plan = await adapter.generate_plan(
             question=question, schema_profile=schema_profile, task_id=task_id
         )
+        raw_skill_plan = _extract_raw_skill_plan(adapter, plan)
         log_event(task_id, "plan", "plan_generated", {"use_mock": use_mock_flag})
     except (CodexAdapterError, Exception) as exc:
         _record_codex_failure(task_id, str(exc))
@@ -421,6 +603,7 @@ async def create_task(
             plan = await MockProvider().generate_plan(
                 question=question, schema_profile=schema_profile, task_id=task_id
             )
+            raw_skill_plan = _extract_raw_skill_plan(adapter, plan)
             schema_profile["codex_fallback_reason"] = str(exc)
             log_event(
                 task_id,
@@ -433,6 +616,8 @@ async def create_task(
     else:
         if not use_mock_flag:
             _reset_codex_failure_counter()
+    if "raw_skill_plan" not in locals():
+        raw_skill_plan = _extract_raw_skill_plan(adapter, plan)
 
     record = TaskRecord(
         task_id=task_id,
@@ -445,16 +630,27 @@ async def create_task(
         ),
         plan=plan,
     )
+    _maybe_attach_completeness_review(record, reason="create_task")
     TASKS[task_id] = record
     TASK_DATAFRAMES[task_id] = df
     TASK_SNAPSHOTS[task_id] = {"schema_profile": schema_profile}
     _persist_task(record)
     save_snapshot(task_id, "input", record.input.model_dump())
     save_snapshot(task_id, "schema_profile", schema_profile)
-    save_snapshot(task_id, "plan", plan.model_dump())
+    _save_plan_compat_snapshots(
+        task_id,
+        plan=plan,
+        raw_skill_plan=raw_skill_plan,
+    )
+    _observe_planner_watermark(task_id)
     log_event(task_id, "create_task", "task_created", {"status": record.status.value})
 
-    return CreateTaskResponse(task_id=task_id, status=record.status, plan=plan)
+    return CreateTaskResponse(
+        task_id=task_id,
+        status=record.status,
+        plan=plan,
+        pending_review=record.pending_review,
+    )
 
 
 @router.post("/{task_id}/revise", response_model=RevisePlanResponse)
@@ -476,6 +672,17 @@ async def revise_plan(
     think_level: str | None = Query(
         default=None,
         description="Alias of reasoning_effort.",
+    ),
+    timeout_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        le=3600,
+        description="Optional per-request Codex subprocess timeout in seconds.",
+    ),
+    auto_timeout: bool = Query(
+        default=False,
+        alias="autoTimeout",
+        description="If true, ignore timeout_seconds and estimate timeout from historical Codex runtimes.",
     ),
 ) -> RevisePlanResponse:
     """Regenerate the analysis plan from user feedback before execution."""
@@ -504,10 +711,19 @@ async def revise_plan(
 
     explicit = use_mock if use_mock is not None else payload.use_mock
     use_mock_flag = _effective_use_mock(explicit)
+    effective_timeout_seconds = resolve_timeout_seconds(
+        auto_timeout=auto_timeout,
+        explicit_timeout_seconds=timeout_seconds,
+        route_kind="task_revise",
+        model=model,
+        reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+        env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+    )
     adapter = get_provider(
         use_mock_flag,
         model=model,
         reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+        timeout_seconds=effective_timeout_seconds,
     )
 
     try:
@@ -517,6 +733,7 @@ async def revise_plan(
             schema_profile=schema_profile,
             task_id=task_id,
         )
+        raw_skill_plan = _extract_raw_skill_plan(adapter, new_plan)
         log_event(task_id, "plan", "plan_revised", {"use_mock": use_mock_flag})
     except (CodexAdapterError, Exception) as exc:
         _record_codex_failure(task_id, str(exc))
@@ -526,12 +743,14 @@ async def revise_plan(
                     status_code=502,
                     detail=f"Codex plan revision failed (mock fallback disabled): {exc}",
                 ) from exc
-            new_plan = await MockProvider().revise_plan(
+            mock_provider = MockProvider()
+            new_plan = await mock_provider.revise_plan(
                 current_plan=record.plan,
                 instruction=instruction,
                 schema_profile=schema_profile,
                 task_id=task_id,
             )
+            raw_skill_plan = _extract_raw_skill_plan(mock_provider, new_plan)
             log_event(
                 task_id,
                 "plan",
@@ -541,11 +760,18 @@ async def revise_plan(
     else:
         if not use_mock_flag:
             _reset_codex_failure_counter()
+    if "raw_skill_plan" not in locals():
+        raw_skill_plan = _extract_raw_skill_plan(adapter, new_plan)
 
     record.plan = new_plan
     record.updated_at = datetime.now(timezone.utc)
     _persist_task(record)
-    save_snapshot(task_id, "plan", new_plan.model_dump())
+    _save_plan_compat_snapshots(
+        task_id,
+        plan=new_plan,
+        raw_skill_plan=raw_skill_plan,
+    )
+    _observe_planner_watermark(task_id)
     log_event(task_id, "revise", "plan_updated", {"status": record.status.value})
 
     return RevisePlanResponse(task_id=task_id, plan=new_plan)
@@ -599,6 +825,17 @@ async def submit_review(
         default=None,
         description="Alias of reasoning_effort.",
     ),
+    timeout_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        le=3600,
+        description="Optional per-request Codex subprocess timeout in seconds.",
+    ),
+    auto_timeout: bool = Query(
+        default=False,
+        alias="autoTimeout",
+        description="If true, ignore timeout_seconds and estimate timeout from historical Codex runtimes.",
+    ),
 ) -> TaskRecord:
     record = _get_task_or_404(task_id)
     explicit = use_mock if use_mock is not None else payload.use_mock
@@ -625,6 +862,14 @@ async def submit_review(
             model=model,
             reasoning_effort=reasoning_effort,
             think_level=think_level,
+            timeout_seconds=resolve_timeout_seconds(
+                auto_timeout=auto_timeout,
+                explicit_timeout_seconds=timeout_seconds,
+                route_kind="task_postprocess",
+                model=model,
+                reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+                env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+            ),
         )
 
     if payload.review_type is None:
@@ -682,6 +927,17 @@ async def respond_review(
         default=None,
         description="Alias of reasoning_effort.",
     ),
+    timeout_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        le=3600,
+        description="Optional per-request Codex subprocess timeout in seconds.",
+    ),
+    auto_timeout: bool = Query(
+        default=False,
+        alias="autoTimeout",
+        description="If true, ignore timeout_seconds and estimate timeout from historical Codex runtimes.",
+    ),
 ) -> TaskRecord:
     record = _get_task_or_404(task_id)
     review = record.pending_review
@@ -707,6 +963,14 @@ async def respond_review(
             model=model,
             reasoning_effort=reasoning_effort,
             think_level=think_level,
+            timeout_seconds=resolve_timeout_seconds(
+                auto_timeout=auto_timeout,
+                explicit_timeout_seconds=timeout_seconds,
+                route_kind="task_revise",
+                model=model,
+                reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+                env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+            ),
         )
         log_event(
             task_id,
@@ -729,6 +993,7 @@ async def respond_review(
     if review.review_type == ReviewType.SUGGESTION and review.suggested_plan is not None:
         accept = (choice or "").strip().lower() in {"accept", "apply", "yes", "confirm"}
         if accept:
+            _assert_plan_runnable_or_400(review.suggested_plan)
             record.plan = review.suggested_plan
             save_snapshot(task_id, "plan", record.plan.model_dump())
             log_event(task_id, "review", "review_suggestion_applied", {"review_id": review.review_id})
@@ -779,12 +1044,32 @@ async def run_task(
         default=None,
         description="Alias of reasoning_effort.",
     ),
+    timeout_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        le=3600,
+        description="Optional per-request Codex subprocess timeout in seconds.",
+    ),
+    auto_timeout: bool = Query(
+        default=False,
+        alias="autoTimeout",
+        description="If true, ignore timeout_seconds and estimate timeout from historical Codex runtimes.",
+    ),
 ) -> TaskRecord:
     record = _get_task_or_404(task_id)
     explicit = use_mock if use_mock is not None else payload.use_mock
     plan_to_run = payload.plan or record.plan
     if plan_to_run is None:
         raise HTTPException(status_code=400, detail="Task has no plan to run")
+    _assert_plan_runnable_or_400(plan_to_run)
+    effective_timeout_seconds = resolve_timeout_seconds(
+        auto_timeout=auto_timeout,
+        explicit_timeout_seconds=timeout_seconds,
+        route_kind="task_postprocess",
+        model=model,
+        reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+        env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+    )
     return await _run_task_with_plan(
         task_id=task_id,
         record=record,
@@ -796,6 +1081,7 @@ async def run_task(
         model=model,
         reasoning_effort=reasoning_effort,
         think_level=think_level,
+        timeout_seconds=effective_timeout_seconds,
     )
 
 

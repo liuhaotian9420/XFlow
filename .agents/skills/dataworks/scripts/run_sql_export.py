@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import re
 import sys
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -43,23 +44,57 @@ def fail(stage: str, msg: str) -> None:
     sys.exit(1)
 
 
+def write_error_log(log_path: Path, stage: str, exc: Exception) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    body = [
+        f"stage: {stage}",
+        f"timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"exception_type: {type(exc).__name__}",
+        f"exception_message: {exc}",
+        "",
+        "traceback:",
+        traceback.format_exc().rstrip(),
+        "",
+    ]
+    log_path.write_text("\n".join(body), encoding="utf-8")
+    print(f"[WARN] Error log saved: {log_path}")
+
+
 def resolve_odps_config(args: argparse.Namespace) -> tuple[str, str, str, str]:
-    access_id = args.access_id or os.getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
-    access_key = args.access_key or os.getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
-    project = args.project or os.getenv("ALIBABA_CLOUD_PROJECT_JINGYING")
-    endpoint = args.endpoint or os.getenv("ALIBABA_CLOUD_REGION_ENDPOINT")
+    access_id = (
+        args.access_id
+        or os.getenv("ODPS_ACCESS_KEY_ID")
+        or os.getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
+    )
+    access_key = (
+        args.access_key
+        or os.getenv("ODPS_ACCESS_KEY_SECRET")
+        or os.getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+    )
+    project = (
+        args.project
+        or os.getenv("ODPS_PROJECT")
+        or os.getenv("ALIBABA_CLOUD_PROJECT_JINGYING")
+    )
+    endpoint = (
+        args.endpoint
+        or os.getenv("ODPS_ENDPOINT")
+        or os.getenv("ALIBABA_CLOUD_REGION_ENDPOINT")
+    )
 
     missing = []
     if not access_id:
-        missing.append("access-id / ALIBABA_CLOUD_ACCESS_KEY_ID")
+        missing.append("access-id / ODPS_ACCESS_KEY_ID")
     if not access_key:
-        missing.append("access-key / ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+        missing.append("access-key / ODPS_ACCESS_KEY_SECRET")
     if not project:
-        missing.append("project / ALIBABA_CLOUD_PROJECT_JINGYING")
+        missing.append("project / ODPS_PROJECT")
     if not endpoint:
-        missing.append("endpoint / ALIBABA_CLOUD_REGION_ENDPOINT")
+        missing.append("endpoint / ODPS_ENDPOINT")
     if missing:
         fail("ODPS authentication/config failure", f"missing: {', '.join(missing)}")
+    
+    print(f"[INFO] ODPS credentials resolved in function: {access_id}, {access_key}, {project}, {endpoint}",flush=True)
 
     return access_id, access_key, project, endpoint
 
@@ -75,7 +110,7 @@ def read_sql_file(path: Path) -> str:
 
 
 def run_odps_sql(
-    sql_text: str, access_id: str, access_key: str, project: str, endpoint: str
+    sql_text: str, access_id: str, access_key: str, project: str, endpoint: str, error_log_path: Path
 ) -> pd.DataFrame:
     try:
         from odps import ODPS
@@ -84,6 +119,7 @@ def run_odps_sql(
 
     try:
         odps = ODPS(access_id=access_id, secret_access_key=access_key, project=project, endpoint=endpoint)
+        print(f"[INFO] ODPS client constructed: {access_id}, {access_key}, {project}, {endpoint}",flush=True)
     except Exception as exc:
         fail("ODPS authentication/config failure", str(exc))
 
@@ -104,9 +140,16 @@ def run_odps_sql(
 
     try:
         with instance.open_reader(tunnel=True, limit=False) as reader:
-            df = reader.to_pandas(n_process=multiprocessing.cpu_count())
+            # df = reader.to_pandas(n_process=multiprocessing.cpu_count())
+            df = reader.to_pandas()
     except Exception as exc:
-        fail("result fetch / reader failure", str(exc))
+        write_error_log(error_log_path, "result fetch / reader failure", exc)
+        try:
+            with instance.open_reader(tunnel=False, limit=False) as reader:
+                df = reader.to_pandas()
+            print("[WARN] Fallback reader succeeded with tunnel=False")
+        except Exception:
+            fail("result fetch / reader failure", str(exc))
 
     return df
 
@@ -189,11 +232,14 @@ def main() -> None:
     # 2. verify ODPS credentials are present through args or env
     access_id, access_key, project, endpoint = resolve_odps_config(args)
 
+    print(f"[INFO] ODPS credentials resolved: {access_id}, {access_key}, {project}, {endpoint}",flush=True)
+
     # 3. read SQL text exactly as-is from disk (already done above)
     # 4. execute SQL in ODPS
     # 5. wait for success before reading results
     # 6. fetch into pandas
-    df = run_odps_sql(sql_text, access_id, access_key, project, endpoint)
+    error_log_path = Path(args.save_path) / f"{sql_path.stem}.error.log"
+    df = run_odps_sql(sql_text, access_id, access_key, project, endpoint, error_log_path)
 
     # 7. if empty, stop and report
     if df.empty:

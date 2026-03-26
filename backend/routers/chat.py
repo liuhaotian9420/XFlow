@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.chat_store import (
@@ -22,6 +24,8 @@ from backend.codex.factory import get_provider
 from backend.codex.mock import MockProvider
 from backend.codex.xinfei_sso import is_xinfei_enterprise_binary, resolve_codex_executable
 from backend.observability import log_event
+from backend.runtime_config import default_use_mock
+from backend.runtime_timeout import resolve_timeout_seconds
 
 router = APIRouter(tags=["chat"])
 logger = logging.getLogger(__name__)
@@ -30,7 +34,7 @@ logger = logging.getLogger(__name__)
 def _effective_use_mock(explicit: bool | None) -> bool:
     if explicit is not None:
         return explicit
-    return os.getenv("CODEX_MOCK", "true").lower() == "true"
+    return default_use_mock()
 
 
 def _effective_reasoning_effort(
@@ -111,6 +115,88 @@ class ChatResponse(BaseModel):
     runtime_binary: str | None = None
 
 
+def _chat_runtime_fields(
+    *,
+    adapter: object,
+    is_fallback: bool,
+    use_mock_flag: bool,
+) -> tuple[str | None, str | None]:
+    resolved_codex = resolve_codex_executable()
+    adapter_command = str(getattr(adapter, "command", "") or "").strip() or resolved_codex
+    if is_fallback:
+        return "mock-fallback", None
+    if use_mock_flag:
+        return "mock", None
+    return (
+        "xinfei-codex" if is_xinfei_enterprise_binary(adapter_command) else "native-codex",
+        adapter_command,
+    )
+
+
+def _sse_json(event: dict[str, object]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def _save_chat_turn_record(
+    *,
+    turn_id: str,
+    session_id: str,
+    chat_id: str,
+    user_message: str,
+    history: list[dict],
+    use_mock_flag: bool,
+    model: str | None,
+    effective_reasoning: str | None,
+    provider_name: str,
+    reply_text: str | None,
+    is_fallback: bool,
+    error_text: str | None,
+    adapter: object,
+    provider_elapsed_s: float | None,
+    provider_overhead_elapsed_s: float | None,
+    api_elapsed_s: float,
+    include_prompt_debug: bool,
+) -> None:
+    save_chat_turn(
+        {
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "chat_id": chat_id,
+            "user_message": user_message,
+            "history_turns": len(history),
+            "use_mock": use_mock_flag,
+            "model": (model or "").strip() or None,
+            "reasoning_effort": effective_reasoning,
+            "provider_name": provider_name,
+            "reply_text": reply_text,
+            "is_fallback": is_fallback,
+            "error_text": error_text,
+            "prompt_chars": getattr(adapter, "last_prompt_chars", None),
+            "input_tokens": getattr(adapter, "last_input_tokens", None),
+            "output_tokens": getattr(adapter, "last_output_tokens", None),
+            "cached_input_tokens": getattr(adapter, "last_cached_input_tokens", None),
+            "codex_exec_elapsed_s": getattr(adapter, "last_exec_elapsed_s", None),
+            "codex_spawn_elapsed_s": getattr(adapter, "last_spawn_elapsed_s", None),
+            "codex_ttft_elapsed_s": getattr(adapter, "last_ttft_elapsed_s", None),
+            "codex_generation_elapsed_s": getattr(
+                adapter, "last_generation_elapsed_s", None
+            ),
+            "codex_teardown_elapsed_s": getattr(adapter, "last_teardown_elapsed_s", None),
+            "provider_elapsed_s": provider_elapsed_s,
+            "provider_overhead_elapsed_s": provider_overhead_elapsed_s,
+            "prompt_build_elapsed_s": getattr(
+                adapter, "last_chat_prompt_build_elapsed_s", None
+            ),
+            "api_elapsed_s": api_elapsed_s,
+            "debug_prompt": (
+                getattr(adapter, "last_chat_prompt_text", None)
+                if include_prompt_debug
+                else None
+            ),
+        }
+    )
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat_message(
     payload: ChatRequest,
@@ -130,6 +216,17 @@ async def chat_message(
         default=None,
         description="Alias of reasoning_effort.",
     ),
+    timeout_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        le=3600,
+        description="Optional per-request Codex subprocess timeout in seconds.",
+    ),
+    auto_timeout: bool = Query(
+        default=False,
+        alias="autoTimeout",
+        description="If true, ignore timeout_seconds and estimate timeout from historical Codex runtimes.",
+    ),
     include_prompt_debug: bool = Query(
         default=False,
         description="When true, include full rendered chat prompt in response for debugging.",
@@ -147,10 +244,19 @@ async def chat_message(
     explicit = use_mock if use_mock is not None else payload.use_mock
     use_mock_flag = _effective_use_mock(explicit)
     effective_reasoning = _effective_reasoning_effort(reasoning_effort, think_level)
+    effective_timeout_seconds = resolve_timeout_seconds(
+        auto_timeout=auto_timeout,
+        explicit_timeout_seconds=timeout_seconds,
+        route_kind="chat",
+        model=model,
+        reasoning_effort=effective_reasoning,
+        env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+    )
     adapter = get_provider(
         use_mock_flag,
         model=model,
         reasoning_effort=effective_reasoning,
+        timeout_seconds=effective_timeout_seconds,
     )
 
     resolved_codex = resolve_codex_executable()
@@ -223,47 +329,24 @@ async def chat_message(
         )
         if not use_mock_flag and explicit is False:
             hint = _auth_hint_for_chat_error(error_text or "", codex_bin=adapter_command)
-            save_chat_turn(
-                {
-                    "turn_id": turn_id,
-                    "session_id": session_id,
-                    "chat_id": chat_id,
-                    "user_message": text,
-                    "history_turns": len(history),
-                    "use_mock": use_mock_flag,
-                    "model": (model or "").strip() or None,
-                    "reasoning_effort": effective_reasoning,
-                    "provider_name": provider_name,
-                    "reply_text": None,
-                    "is_fallback": False,
-                    "error_text": error_text,
-                    "prompt_chars": getattr(adapter, "last_prompt_chars", None),
-                    "input_tokens": getattr(adapter, "last_input_tokens", None),
-                    "output_tokens": getattr(adapter, "last_output_tokens", None),
-                    "cached_input_tokens": getattr(
-                        adapter, "last_cached_input_tokens", None
-                    ),
-                    "codex_exec_elapsed_s": getattr(adapter, "last_exec_elapsed_s", None),
-                    "codex_spawn_elapsed_s": getattr(adapter, "last_spawn_elapsed_s", None),
-                    "codex_ttft_elapsed_s": getattr(adapter, "last_ttft_elapsed_s", None),
-                    "codex_generation_elapsed_s": getattr(
-                        adapter, "last_generation_elapsed_s", None
-                    ),
-                    "codex_teardown_elapsed_s": getattr(
-                        adapter, "last_teardown_elapsed_s", None
-                    ),
-                    "provider_elapsed_s": provider_elapsed_s,
-                    "provider_overhead_elapsed_s": None,
-                    "prompt_build_elapsed_s": getattr(
-                        adapter, "last_chat_prompt_build_elapsed_s", None
-                    ),
-                    "api_elapsed_s": time.perf_counter() - t0,
-                    "debug_prompt": (
-                        getattr(adapter, "last_chat_prompt_text", None)
-                        if include_prompt_debug
-                        else None
-                    ),
-                }
+            _save_chat_turn_record(
+                turn_id=turn_id,
+                session_id=session_id,
+                chat_id=chat_id,
+                user_message=text,
+                history=history,
+                use_mock_flag=use_mock_flag,
+                model=model,
+                effective_reasoning=effective_reasoning,
+                provider_name=provider_name,
+                reply_text=None,
+                is_fallback=False,
+                error_text=error_text,
+                adapter=adapter,
+                provider_elapsed_s=provider_elapsed_s,
+                provider_overhead_elapsed_s=None,
+                api_elapsed_s=time.perf_counter() - t0,
+                include_prompt_debug=include_prompt_debug,
             )
             raise HTTPException(
                 status_code=502,
@@ -339,37 +422,247 @@ async def chat_message(
         runtime_vendor=runtime_vendor,
         runtime_binary=runtime_binary,
     )
-    save_chat_turn(
-        {
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "chat_id": chat_id,
-            "user_message": text,
-            "history_turns": len(history),
-            "use_mock": use_mock_flag,
-            "model": (model or "").strip() or None,
-            "reasoning_effort": effective_reasoning,
-            "provider_name": provider_name,
-            "reply_text": response.reply,
-            "is_fallback": is_fallback,
-            "error_text": error_text,
-            "prompt_chars": response.prompt_chars,
-            "input_tokens": response.input_tokens,
-            "output_tokens": response.output_tokens,
-            "cached_input_tokens": response.cached_input_tokens,
-            "codex_exec_elapsed_s": response.codex_exec_elapsed_s,
-            "codex_spawn_elapsed_s": response.codex_spawn_elapsed_s,
-            "codex_ttft_elapsed_s": response.codex_ttft_elapsed_s,
-            "codex_generation_elapsed_s": response.codex_generation_elapsed_s,
-            "codex_teardown_elapsed_s": response.codex_teardown_elapsed_s,
-            "provider_elapsed_s": response.provider_elapsed_s,
-            "provider_overhead_elapsed_s": response.provider_overhead_elapsed_s,
-            "prompt_build_elapsed_s": response.prompt_build_elapsed_s,
-            "api_elapsed_s": response.api_elapsed_s,
-            "debug_prompt": response.debug_prompt,
-        }
+    _save_chat_turn_record(
+        turn_id=turn_id,
+        session_id=session_id,
+        chat_id=chat_id,
+        user_message=text,
+        history=history,
+        use_mock_flag=use_mock_flag,
+        model=model,
+        effective_reasoning=effective_reasoning,
+        provider_name=provider_name,
+        reply_text=response.reply,
+        is_fallback=is_fallback,
+        error_text=error_text,
+        adapter=adapter,
+        provider_elapsed_s=response.provider_elapsed_s,
+        provider_overhead_elapsed_s=response.provider_overhead_elapsed_s,
+        api_elapsed_s=response.api_elapsed_s or 0.0,
+        include_prompt_debug=include_prompt_debug,
     )
     return response
+
+
+@router.post("/chat/stream")
+async def chat_message_stream(
+    payload: ChatRequest,
+    use_mock: bool | None = Query(default=None),
+    model: str | None = Query(default=None),
+    reasoning_effort: str | None = Query(default=None),
+    think_level: str | None = Query(default=None),
+    timeout_seconds: int | None = Query(default=None, ge=1, le=3600),
+    auto_timeout: bool = Query(default=False, alias="autoTimeout"),
+    include_prompt_debug: bool = Query(default=False),
+) -> StreamingResponse:
+    text = payload.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="message must not be empty")
+
+    chat_id = str(uuid.uuid4())
+    session_id = (payload.session_id or "").strip() or str(uuid.uuid4())
+    turn_id = str(uuid.uuid4())
+    history = [m.model_dump() for m in payload.history]
+    explicit = use_mock if use_mock is not None else payload.use_mock
+    use_mock_flag = _effective_use_mock(explicit)
+    effective_reasoning = _effective_reasoning_effort(reasoning_effort, think_level)
+    effective_timeout_seconds = resolve_timeout_seconds(
+        auto_timeout=auto_timeout,
+        explicit_timeout_seconds=timeout_seconds,
+        route_kind="chat",
+        model=model,
+        reasoning_effort=effective_reasoning,
+        env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+    )
+    adapter = get_provider(
+        use_mock_flag,
+        model=model,
+        reasoning_effort=effective_reasoning,
+        timeout_seconds=effective_timeout_seconds,
+    )
+    resolved_codex = resolve_codex_executable()
+    adapter_command = str(getattr(adapter, "command", "") or "").strip() or resolved_codex
+    provider_name = type(adapter).__name__
+
+    async def _event_gen():
+        provider_elapsed_s: float | None = None
+        provider_overhead_elapsed_s: float | None = None
+        error_text: str | None = None
+        is_fallback = False
+        final_reply: str | None = None
+        final_emitted = False
+        error_emitted = False
+        saved = False
+        t0 = time.perf_counter()
+        try:
+            p0 = time.perf_counter()
+            if isinstance(adapter, MockProvider):
+                reply = await adapter.chat(
+                    message=text,
+                    history=history,
+                    file_context=payload.file_context,
+                    task_id=chat_id,
+                )
+                provider_elapsed_s = time.perf_counter() - p0
+                runtime_vendor, runtime_binary = _chat_runtime_fields(
+                    adapter=adapter,
+                    is_fallback=False,
+                    use_mock_flag=use_mock_flag,
+                )
+                final_event = {
+                    "type": "final",
+                    "chat_id": chat_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "reply": reply,
+                    "timing": {
+                        "provider_elapsed_s": provider_elapsed_s,
+                        "api_elapsed_s": time.perf_counter() - t0,
+                    },
+                    "runtime_vendor": runtime_vendor,
+                    "runtime_binary": runtime_binary,
+                }
+                final_reply = reply
+                final_emitted = True
+                yield _sse_json(final_event)
+                return
+
+            async for event in adapter.stream_chat(
+                message=text,
+                history=history,
+                file_context=payload.file_context,
+                chat_id=chat_id,
+            ):
+                event_type = str(event.get("type") or "").strip().lower()
+                if event_type == "error":
+                    error_text = str(event.get("error") or "").strip() or error_text
+                    error_emitted = True
+                if event_type == "final":
+                    provider_elapsed_s = time.perf_counter() - p0
+                    codex_exec_elapsed_s = getattr(adapter, "last_exec_elapsed_s", None)
+                    if (
+                        isinstance(provider_elapsed_s, (int, float))
+                        and isinstance(codex_exec_elapsed_s, (int, float))
+                    ):
+                        provider_overhead_elapsed_s = max(
+                            0.0, float(provider_elapsed_s) - float(codex_exec_elapsed_s)
+                        )
+                    runtime_vendor, runtime_binary = _chat_runtime_fields(
+                        adapter=adapter,
+                        is_fallback=False,
+                        use_mock_flag=use_mock_flag,
+                    )
+                    final_reply = str(event.get("reply") or "").strip() or None
+                    event["session_id"] = session_id
+                    event["turn_id"] = turn_id
+                    event["runtime_vendor"] = runtime_vendor
+                    event["runtime_binary"] = runtime_binary
+                    event.setdefault("timing", {})
+                    if isinstance(event["timing"], dict):
+                        event["timing"]["provider_elapsed_s"] = provider_elapsed_s
+                        event["timing"]["provider_overhead_elapsed_s"] = provider_overhead_elapsed_s
+                        event["timing"]["api_elapsed_s"] = time.perf_counter() - t0
+                    final_emitted = True
+                yield _sse_json(event)
+
+            if final_reply is None and error_text is None:
+                error_text = "Stream ended without a final reply."
+                yield _sse_json(
+                    {
+                        "type": "error",
+                        "chat_id": chat_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "error": error_text,
+                    }
+                )
+                error_emitted = True
+        except (CodexAdapterError, Exception) as exc:
+            error_text = f"{type(exc).__name__}: {exc!s}"
+            logger.exception(
+                "CHAT stream failed chat_id=%s after %.2fs use_mock=%s explicit_query=%s provider=%s resolved_codex=%s",
+                chat_id,
+                time.perf_counter() - t0,
+                use_mock_flag,
+                explicit,
+                provider_name,
+                resolved_codex,
+            )
+            if not final_emitted and not use_mock_flag and explicit is not False:
+                is_fallback = True
+                mock_provider = MockProvider()
+                reply = await mock_provider.chat(
+                    message=text,
+                    history=history,
+                    file_context=payload.file_context,
+                    task_id=chat_id,
+                )
+                final_reply = reply
+                runtime_vendor, runtime_binary = _chat_runtime_fields(
+                    adapter=adapter,
+                    is_fallback=True,
+                    use_mock_flag=use_mock_flag,
+                )
+                fallback_event = {
+                    "type": "final",
+                    "chat_id": chat_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "reply": reply,
+                    "runtime_vendor": runtime_vendor,
+                    "runtime_binary": runtime_binary,
+                    "error": error_text,
+                    "timing": {
+                        "provider_elapsed_s": provider_elapsed_s,
+                        "api_elapsed_s": time.perf_counter() - t0,
+                    },
+                }
+                final_emitted = True
+                yield _sse_json(fallback_event)
+                return
+            if not final_emitted and not error_emitted:
+                yield _sse_json(
+                    {
+                        "type": "error",
+                        "chat_id": chat_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "error": error_text,
+                        "runtime_vendor": (
+                            "xinfei-codex"
+                            if is_xinfei_enterprise_binary(adapter_command)
+                            else "native-codex"
+                        )
+                        if not use_mock_flag
+                        else "mock",
+                        "runtime_binary": adapter_command if not use_mock_flag else None,
+                    }
+                )
+                error_emitted = True
+        finally:
+            if not saved:
+                _save_chat_turn_record(
+                    turn_id=turn_id,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    user_message=text,
+                    history=history,
+                    use_mock_flag=use_mock_flag,
+                    model=model,
+                    effective_reasoning=effective_reasoning,
+                    provider_name=provider_name,
+                    reply_text=final_reply,
+                    is_fallback=is_fallback,
+                    error_text=error_text,
+                    adapter=adapter,
+                    provider_elapsed_s=provider_elapsed_s,
+                    provider_overhead_elapsed_s=provider_overhead_elapsed_s,
+                    api_elapsed_s=time.perf_counter() - t0,
+                    include_prompt_debug=include_prompt_debug,
+                )
+                saved = True
+
+    return StreamingResponse(_event_gen(), media_type="text/event-stream")
 
 
 class ChatSessionMeta(BaseModel):

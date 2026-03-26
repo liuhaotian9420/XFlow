@@ -1,30 +1,28 @@
 param(
+    [ValidateSet("demo", "real")]
+    [string]$Mode = "demo",
     [string]$ApiBaseUrl = "http://127.0.0.1:8000",
-    [string]$CodexMock = "true",
-    [string]$CodexModel = "",
-    [string]$CodexReasoningEffort = ""
+    [switch]$NoReload,
+    [switch]$SkipSync
 )
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "Starting xyf-competition-mvp dev stack..."
-Write-Host "API_BASE_URL=$ApiBaseUrl"
-Write-Host "CODEX_MOCK=$CodexMock"
-if ($CodexModel) { Write-Host "CODEX_MODEL=$CodexModel" }
-if ($CodexReasoningEffort) { Write-Host "CODEX_REASONING_EFFORT=$CodexReasoningEffort" }
+Write-Host "start-dev.ps1 is deprecated. Use start-demo.ps1 or start-real.ps1."
 
-$env:CODEX_MOCK = $CodexMock
-$env:API_BASE_URL = $ApiBaseUrl
-if ($CodexModel) { $env:CODEX_MODEL = $CodexModel }
-if ($CodexReasoningEffort) { $env:CODEX_REASONING_EFFORT = $CodexReasoningEffort }
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$scriptPath = if ($Mode -eq "real") {
+    Join-Path $PSScriptRoot "start-real.ps1"
+} else {
+    Join-Path $PSScriptRoot "start-demo.ps1"
+}
 
-$projectRoot = (Get-Location).Path
+$args = @("-ApiBaseUrl", $ApiBaseUrl)
+if ($NoReload.IsPresent) {
+    $args += "-NoReload"
+}
+if ($SkipSync.IsPresent) {
+    $args += "-SkipSync"
+}
 
-Start-Process powershell -ArgumentList "-NoExit", "-Command", @"
-Set-Location '$projectRoot'; `$env:CODEX_MOCK='$CodexMock'; `$env:API_BASE_URL='$ApiBaseUrl'; `$env:CODEX_MODEL='$CodexModel'; `$env:CODEX_REASONING_EFFORT='$CodexReasoningEffort'; uv run uvicorn backend.main:app --reload --loop backend.loop_factory:proactor_loop_factory
-"@
-Start-Process powershell -ArgumentList "-NoExit", "-Command", @"
-Set-Location '$projectRoot'; `$env:CODEX_MOCK='$CodexMock'; `$env:API_BASE_URL='$ApiBaseUrl'; `$env:CODEX_MODEL='$CodexModel'; `$env:CODEX_REASONING_EFFORT='$CodexReasoningEffort'; uv run streamlit run app/streamlit_app.py
-"@
-
-Write-Host "Backend and Streamlit launched in separate terminals."
+& powershell -ExecutionPolicy Bypass -File $scriptPath @args
