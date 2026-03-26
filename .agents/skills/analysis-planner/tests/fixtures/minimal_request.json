@@ -1,0 +1,20 @@
+{
+  "user_question": "Analyze monthly revenue by region and identify the top performing regions in Q1 2026.",
+  "schema_profile": {
+    "row_count": 12000,
+    "columns": [
+      { "name": "order_id", "dtype": "string" },
+      { "name": "order_date", "dtype": "date" },
+      { "name": "region", "dtype": "string" },
+      { "name": "revenue", "dtype": "double" },
+      { "name": "channel", "dtype": "string" }
+    ],
+    "dtypes": {
+      "order_id": "string",
+      "order_date": "date",
+      "region": "string",
+      "revenue": "double",
+      "channel": "string"
+    }
+  }
+}

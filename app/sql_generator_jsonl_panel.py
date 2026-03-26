@@ -1,4 +1,4 @@
-"""Streamlit panel: run sql-generator Codex JSONL smoke test (same as tests/run_codex_json_stream.py)."""
+"""Streamlit panel: run sql-generator Codex JSONL smoke test."""
 
 from __future__ import annotations
 
@@ -10,12 +10,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from backend.codex.sql_generator_jsonl_runner import (
-    SqlGeneratorJsonStreamResult,
-    load_cases_dicts,
-    run_sql_generator_json_stream,
-    run_sql_generator_json_stream_inline,
-)
+from backend.codex import sql_generator_jsonl_runner as jsonl_runner
 
 _STREAM_KEY = "sql_jsonl_stream_result"
 _ERROR_KEY = "sql_jsonl_stream_error"
@@ -31,6 +26,15 @@ def _default_out_dir(repo: Path) -> Path:
 
 
 def render_sql_generator_jsonl_panel() -> None:
+    SqlGeneratorJsonStreamResult = jsonl_runner.SqlGeneratorJsonStreamResult
+    load_cases_dicts = jsonl_runner.load_cases_dicts
+    run_sql_generator_json_stream = jsonl_runner.run_sql_generator_json_stream
+    run_sql_generator_json_stream_inline = getattr(
+        jsonl_runner,
+        "run_sql_generator_json_stream_inline",
+        None,
+    )
+
     repo = _repo_root()
     cases_path = repo / "tests" / "sql_generator_eval_cases.json"
     e2e_path = repo / "tests" / "e2e_simple_case.json"
@@ -39,7 +43,7 @@ def render_sql_generator_jsonl_panel() -> None:
         "Run **`codex exec --json`** (same CLI as `tests/run_codex_json_stream.py`). "
         "Requires a working **Codex CLI** on the machine that runs Streamlit (not the FastAPI mock). "
         "Full handoff to dataworks + mocked ODPS: `uv run python tests/e2e_codex_sql_to_dataworks.py`. "
-        "**Serial two skills** in one Codex run (sql-generator → sql-export-agent): "
+        "**Serial two skills** in one Codex run (sql-generator -> sql-export-agent): "
         "`uv run python tests/e2e_codex_two_skills_serial.py`. "
         "**Full chain** (DuckDB under `.agents/assets/` + scorecardpy, scripted steps): "
         "`uv run python tests/e2e_codex_dataworks_scorecardpy.py`. "
@@ -127,8 +131,13 @@ def render_sql_generator_jsonl_panel() -> None:
         st.session_state[_UI_NONCE_KEY] = int(st.session_state.get(_UI_NONCE_KEY, 0)) + 1
         out_dir = _default_out_dir(repo) if persist else None
         try:
-            with st.spinner(f"Running codex (case={case_id}, mode={mode})…"):
+            with st.spinner(f"Running codex (case={case_id}, mode={mode})..."):
                 if use_inline and business_request_inline:
+                    if run_sql_generator_json_stream_inline is None:
+                        raise RuntimeError(
+                            "run_sql_generator_json_stream_inline is unavailable in "
+                            "backend.codex.sql_generator_jsonl_runner"
+                        )
                     result = run_sql_generator_json_stream_inline(
                         repo_root=repo,
                         case_id=case_id,
@@ -162,7 +171,7 @@ def render_sql_generator_jsonl_panel() -> None:
         return
 
     if result.returncode != 0:
-        st.warning(f"Codex exited with code **{result.returncode}** — check stderr below.")
+        st.warning(f"Codex exited with code **{result.returncode}**; check stderr below.")
 
     m1, m2, m3 = st.columns(3)
     with m1:
@@ -181,21 +190,21 @@ def render_sql_generator_jsonl_panel() -> None:
 
     st.subheader("JSONL stream (stdout)")
     jtext = result.jsonl_text
-    _nonce = int(st.session_state.get(_UI_NONCE_KEY, 0))
+    nonce = int(st.session_state.get(_UI_NONCE_KEY, 0))
     if len(jtext) > 1_200_000:
-        st.caption("Output very large — use download or on-disk file.")
+        st.caption("Output very large; use download or on-disk file.")
         st.text_area(
             "jsonl (truncated)",
-            value=jtext[:500_000] + "\n\n… [truncated for UI]",
+            value=jtext[:500_000] + "\n\n... [truncated for UI]",
             height=400,
-            key=f"sql_jsonl_ta_trunc_{_nonce}",
+            key=f"sql_jsonl_ta_trunc_{nonce}",
         )
     else:
         st.text_area(
             "jsonl",
             value=jtext,
             height=480,
-            key=f"sql_jsonl_ta_{_nonce}",
+            key=f"sql_jsonl_ta_{nonce}",
             help="Line-delimited JSON events from `codex exec --json`.",
         )
 
@@ -204,7 +213,7 @@ def render_sql_generator_jsonl_panel() -> None:
         data=jtext.encode("utf-8"),
         file_name=f"codex_exec__{result.case_id}__{result.mode}.jsonl",
         mime="application/x-ndjson",
-        key=f"sql_jsonl_dl_{_nonce}",
+        key=f"sql_jsonl_dl_{nonce}",
     )
 
     st.subheader("Event index")
@@ -251,7 +260,7 @@ def _jsonl_event_summary(jtext: str) -> list[dict[str, Any]]:
         if isinstance(item, dict) and item.get("type") == "agent_message":
             tx = item.get("text")
             if isinstance(tx, str):
-                note = tx[:100] + ("…" if len(tx) > 100 else "")
+                note = tx[:100] + ("..." if len(tx) > 100 else "")
         rows.append(
             {
                 "line": i,

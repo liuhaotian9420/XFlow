@@ -102,16 +102,17 @@ def _run_codex_sql_generator_prompt(
             # Codex CLI forbids combining bypass flag with explicit approval policy.
             argv.append("--dangerously-bypass-approvals-and-sandbox")
         else:
-            if sandbox_mode:
-                argv.extend(["-s", sandbox_mode])
             if approval_policy:
                 argv.extend(["-a", approval_policy])
+        argv.append("exec")
+        if not bypass_sandbox:
+            if sandbox_mode:
+                argv.extend(["-s", sandbox_mode])
         for override in codex_config_overrides or []:
             if (override or "").strip():
                 argv.extend(["-c", override.strip()])
         argv.extend(
             [
-                "exec",
                 "--json",
                 "-o",
                 out_for_codex,

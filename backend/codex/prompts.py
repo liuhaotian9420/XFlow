@@ -19,11 +19,19 @@ CRITICAL output rules:
 - Respond with ONE JSON object only.
 - No markdown, no code fences, no explanation before or after the JSON.
 - Use only column names that appear in the schema profile below.
+- Output MUST follow the skill-native AnalysisPlan contract (goal/scope/grain/methods/validation/etc.).
 - "aggregation" must be one of: sum, mean, count, max, min, median.
 - "operator" must be one of: eq, neq, gt, gte, lt, lte, in, not_in, contains.
-- "role" must be one of: time, category, geo.
-- "chart_type" must be one of: line, bar, histogram.
-- Set "confidence" between 0.0 and 1.0. List real uncertainties in "ambiguities".
+- "analysis_type" must be one of: descriptive, diagnostic, trend, comparison, distribution, segmentation, ranking.
+- "method.type" must be one of: aggregate, timeseries, top_n, distribution, group_compare, period_compare.
+- "null_policy" must be one of: include, exclude, separate_bucket (or null).
+- "role" must be one of: time, category, geo (or null when uncertain).
+- "output.chart_type" may be: line, bar, histogram, table.
+- "completion_state" must be one of: needs_clarification, minimally_completed, reviewed.
+- Set "confidence" between 0.0 and 1.0 and record real uncertainty in "ambiguities".
+- "metrics" must contain at least one item.
+- "methods" must contain at least one item.
+- "output.table_fields" must contain at least one item.
 
 Question:
 {question}
@@ -33,22 +41,109 @@ Schema profile:
 
 Output JSON must match this shape (field names and types):
 {{
-  "goal": "string",
+  "goal": {{
+    "question": "string",
+    "decision_context": "string|null",
+    "success_criteria": "string|null"
+  }},
+  "scope": {{
+    "entity": "string|null",
+    "population": "string",
+    "assumptions": ["string"]
+  }},
+  "analysis_type": "descriptive|diagnostic|trend|comparison|distribution|segmentation|ranking",
+  "grain": {{
+    "primary_key": ["string"],
+    "answer_unit": "string",
+    "aggregation_level": "string|null"
+  }},
   "metrics": [
-    {{"column": "string", "aggregation": "sum|mean|count|max|min|median", "alias": "string|null"}}
+    {{
+      "name": "string",
+      "column": "string",
+      "aggregation": "sum|mean|count|max|min|median",
+      "definition": "string|null",
+      "format": "string|null",
+      "constraints": ["string"]
+    }}
   ],
   "dimensions": [
-    {{"column": "string", "role": "time|category|geo"}}
+    {{
+      "column": "string",
+      "role": "time|category|geo|null",
+      "label": "string|null",
+      "reason": "string|null"
+    }}
   ],
   "filters": [
-    {{"column": "string", "operator": "eq|neq|gt|gte|lt|lte|in|not_in|contains", "value": "any"}}
+    {{
+      "column": "string",
+      "operator": "eq|neq|gt|gte|lt|lte|in|not_in|contains",
+      "value": "any",
+      "required": "boolean|null"
+    }}
+  ],
+  "segments": [
+    {{
+      "name": "string|null",
+      "column": "string|null",
+      "definition": "string|null"
+    }}
+  ],
+  "time": {{
+    "time_column": "string|null",
+    "grain": "string|null",
+    "window": "string|null",
+    "comparison_window": "string|null"
+  }},
+  "derived_fields": [
+    {{
+      "name": "string",
+      "expression_logic": "string",
+      "source_columns": ["string"]
+    }}
+  ],
+  "comparisons": [
+    {{
+      "type": "string",
+      "left": "string|null",
+      "right": "string|null",
+      "metric_names": ["string"],
+      "expected_signal": "string|null"
+    }}
+  ],
+  "methods": [
+    {{
+      "name": "string",
+      "type": "aggregate|timeseries|top_n|distribution|group_compare|period_compare",
+      "inputs": ["string"],
+      "description": "string",
+      "null_policy": "include|exclude|separate_bucket|null"
+    }}
+  ],
+  "validation": {{
+    "data_quality_checks": ["string"],
+    "metric_sanity_checks": ["string"],
+    "coverage_checks": ["string"]
   ],
   "output": {{
-    "chart_type": "line|bar|histogram",
-    "show_table": true
+    "table_fields": ["string"],
+    "chart_type": "line|bar|histogram|table|null",
+    "title": "string|null",
+    "sort": "string|null",
+    "limit": "integer|null",
+    "narrative_focus": "string|null"
   }},
-  "ambiguities": [{{"field": "string", "issue": "string"}}],
-  "confidence": 0.0
+  "ambiguities": [
+    {{
+      "field": "string|null",
+      "issue": "string",
+      "severity": "string|null",
+      "blocks_minimal_completion": "boolean|null"
+    }}
+  ],
+  "confidence": 0.0,
+  "completion_state": "needs_clarification|minimally_completed|reviewed"
 }}
 """.strip()
 
@@ -138,13 +233,13 @@ CRITICAL output rules:
 - Respond with ONE JSON object only (the full revised plan).
 - No markdown, no code fences, no explanation before or after the JSON.
 - Use only column names that appear in the schema profile below.
-- Preserve the same JSON shape as the current plan (goal, metrics, dimensions, filters, output, ambiguities, confidence).
+- Preserve the same JSON shape as the current plan, including completeness assessment fields.
 - Apply the user's instruction faithfully; adjust metrics, dimensions, filters, chart type, or goal text as needed.
 - "aggregation" must be one of: sum, mean, count, max, min, median.
 - "operator" must be one of: eq, neq, gt, gte, lt, lte, in, not_in, contains.
 - "role" must be one of: time, category, geo.
 - "chart_type" must be one of: line, bar, histogram.
-- Update "ambiguities" and "confidence" to reflect any remaining uncertainty after the revision.
+- Update "ambiguities", "confidence", and "completeness" to reflect any remaining uncertainty after the revision.
 
 Current plan:
 {plan_json}

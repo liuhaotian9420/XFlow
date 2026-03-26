@@ -23,16 +23,37 @@ Revise an existing AnalysisPlan and return the full updated JSON.
 
 ## Output constraints
 - Return exactly one JSON object, no markdown.
-- Preserve AnalysisPlan shape: goal, metrics, dimensions, filters, output, ambiguities, confidence.
+- Preserve full AnalysisPlan shape:
+  - `goal`
+  - `scope`
+  - `analysis_type`
+  - `grain`
+  - `metrics`
+  - `dimensions`
+  - `filters`
+  - `segments`
+  - `time`
+  - `derived_fields`
+  - `comparisons`
+  - `methods`
+  - `validation`
+  - `output`
+  - `ambiguities`
+  - `confidence`
 - Use only columns from schema profile.
 - Allowed values:
   - aggregation: sum, mean, count, max, min, median
   - operator: eq, neq, gt, gte, lt, lte, in, not_in, contains
   - role: time, category, geo
-  - chart_type: line, bar, histogram
+  - chart_type: line, bar, histogram, table
+  - analysis_type: descriptive, diagnostic, trend, comparison, distribution, segmentation, ranking
+  - method: aggregate, timeseries, top_n, distribution, group_compare, period_compare
+  - null_policy: include, exclude, separate_bucket
 
 ## Failure handling
 - If instruction is partially ambiguous, apply best-effort revision and record remaining ambiguity.
+- Keep the plan internally coherent after revision. If one section changes the analytical logic, update dependent sections such as `methods`, `validation`, and `output`.
 
 ## Boundaries
 - Do not return partial patches; always return full revised plan object.
+- Do not retain stale fields that no longer match the revised intent.

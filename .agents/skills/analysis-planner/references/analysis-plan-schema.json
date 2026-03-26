@@ -1,0 +1,55 @@
+{
+  "title": "AnalysisPlan",
+  "type": "object",
+  "required": [
+    "goal",
+    "scope",
+    "analysis_type",
+    "grain",
+    "metrics",
+    "dimensions",
+    "filters",
+    "segments",
+    "time",
+    "derived_fields",
+    "comparisons",
+    "methods",
+    "validation",
+    "output",
+    "ambiguities",
+    "confidence"
+  ],
+  "properties": {
+    "goal": { "type": "object" },
+    "scope": { "type": "object" },
+    "analysis_type": {
+      "type": "string",
+      "enum": [
+        "descriptive",
+        "diagnostic",
+        "trend",
+        "comparison",
+        "distribution",
+        "segmentation",
+        "ranking"
+      ]
+    },
+    "grain": { "type": "object" },
+    "metrics": { "type": "array" },
+    "dimensions": { "type": "array" },
+    "filters": { "type": "array" },
+    "segments": { "type": "array" },
+    "time": { "type": "object" },
+    "derived_fields": { "type": "array" },
+    "comparisons": { "type": "array" },
+    "methods": { "type": "array" },
+    "validation": { "type": "object" },
+    "output": { "type": "object" },
+    "ambiguities": { "type": "array" },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  }
+}

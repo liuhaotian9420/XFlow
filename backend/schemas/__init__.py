@@ -5,7 +5,11 @@ from .plan import (
     AnalysisPlan,
     ChartType,
     DimensionRole,
+    ExplorationPriority,
     FilterOperator,
+    PlanRecommendedAction,
+    PlanCompletenessStatus,
+    SkillAnalysisPlan,
 )
 from .result import ResultPayload
 from .task import ReviewState, ReviewType, TaskRecord, TaskReview, TaskStatus
@@ -15,7 +19,11 @@ __all__ = [
     "AnalysisPlan",
     "ChartType",
     "DimensionRole",
+    "ExplorationPriority",
     "FilterOperator",
+    "PlanRecommendedAction",
+    "PlanCompletenessStatus",
+    "SkillAnalysisPlan",
     "ResultPayload",
     "ReviewState",
     "ReviewType",

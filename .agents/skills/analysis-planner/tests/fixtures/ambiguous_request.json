@@ -1,0 +1,16 @@
+{
+  "user_question": "Tell me what is happening with customers lately.",
+  "schema_profile": {
+    "row_count": 5000,
+    "columns": [
+      { "name": "customer_id", "dtype": "string" },
+      { "name": "event_date", "dtype": "date" },
+      { "name": "status", "dtype": "string" }
+    ],
+    "dtypes": {
+      "customer_id": "string",
+      "event_date": "date",
+      "status": "string"
+    }
+  }
+}

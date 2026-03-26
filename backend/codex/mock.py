@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from backend.planning.adapters import parse_plan_payload
 from backend.schemas.plan import (
     Aggregation,
     AmbiguitySpec,
@@ -9,19 +10,26 @@ from backend.schemas.plan import (
     ChartType,
     DimensionRole,
     DimensionSpec,
+    ExplorationPriority,
+    ExplorationTaskSpec,
     FilterOperator,
     FilterSpec,
     MetricSpec,
     OutputSpec,
+    PlanAssumptionSpec,
+    PlanCompletenessSpec,
+    PlanCompletenessStatus,
+    PlanQuestionSpec,
 )
 
 
 class MockProvider:
-    """Return deterministic plans/summaries without invoking an external agent."""
+    """Return deterministic plans and summaries without invoking an external agent."""
 
     async def generate_plan(
         self, question: str, schema_profile: dict, task_id: str = "mock"
     ) -> AnalysisPlan:
+        self.last_raw_skill_plan: dict | None = None
         columns = {col["name"] for col in schema_profile.get("columns", [])}
         metric_col = self._pick_metric_column(columns)
         time_col = self._pick_time_column(columns)
@@ -34,7 +42,7 @@ class MockProvider:
                 alias=f"{metric_col}_sum",
             )
         ]
-        dimensions = []
+        dimensions: list[DimensionSpec] = []
         if time_col:
             dimensions.append(DimensionSpec(column=time_col, role=DimensionRole.TIME))
         if category_col and category_col != time_col:
@@ -44,11 +52,11 @@ class MockProvider:
 
         filters: list[FilterSpec] = []
         lower_question = question.lower()
-        if "华东" in question and "region" in columns:
+        if ("east" in lower_question or "east china" in lower_question) and "region" in columns:
             filters.append(
-                FilterSpec(column="region", operator=FilterOperator.EQ, value="华东")
+                FilterSpec(column="region", operator=FilterOperator.EQ, value="east")
             )
-        if "最近" in question and time_col:
+        if any(token in lower_question for token in ("latest", "recent", "2025")) and time_col:
             filters.append(
                 FilterSpec(
                     column=time_col,
@@ -58,9 +66,9 @@ class MockProvider:
             )
 
         chart_type = ChartType.LINE if time_col else ChartType.BAR
-        if "分布" in question or "distribution" in lower_question:
+        if "distribution" in lower_question:
             chart_type = ChartType.HISTOGRAM
-        elif "对比" in question or "比较" in question or "compare" in lower_question:
+        elif "compare" in lower_question:
             chart_type = ChartType.BAR
 
         confidence, ambiguities = self._assess_confidence(
@@ -71,16 +79,30 @@ class MockProvider:
             category_col=category_col,
             filters=filters,
         )
+        completeness = self._build_completeness(
+            question=question,
+            ambiguities=ambiguities,
+            time_col=time_col,
+            category_col=category_col,
+        )
 
-        return AnalysisPlan(
+        plan = AnalysisPlan(
             goal=question.strip() or "Analyze uploaded data",
             metrics=metrics,
             dimensions=dimensions,
             filters=filters,
             output=OutputSpec(chart_type=chart_type, show_table=True),
+            assumptions=self._build_assumptions(
+                metric_col=metric_col,
+                time_col=time_col,
+            ),
             confidence=confidence,
             ambiguities=ambiguities,
+            completeness=completeness,
         )
+        parsed, raw_skill = parse_plan_payload(plan.model_dump(mode="json"))
+        self.last_raw_skill_plan = raw_skill
+        return parsed
 
     async def generate_summary(
         self,
@@ -99,9 +121,9 @@ class MockProvider:
         self, goal: str, result_df_summary: dict, task_id: str = "mock"
     ) -> list[str]:
         return [
-            f"是否需要按时间趋势继续分析：{goal}？",
-            "是否需要按区域或部门做对比？",
-            "是否需要定位异常峰值对应的明细记录？",
+            f"Do you want to continue with a time trend analysis for '{goal}'?",
+            "Do you want a category or region comparison next?",
+            "Do you want to inspect the detailed rows behind outliers?",
         ]
 
     async def chat(
@@ -111,36 +133,26 @@ class MockProvider:
         file_context: dict | None,
         task_id: str = "mock",
     ) -> str:
-        fname = None
-        rows = None
-        cols = None
         if file_context:
-            fname = file_context.get("filename")
-            rows = file_context.get("row_count")
-            cols = file_context.get("column_count")
+            filename = file_context.get("filename", "unknown")
+            rows = file_context.get("row_count", "?")
+            cols = file_context.get("column_count", "?")
             col_names = [
                 c.get("name")
                 for c in (file_context.get("columns") or [])
                 if isinstance(c, dict) and c.get("name")
             ]
-            col_hint = (
-                f"主要字段包括：{', '.join(col_names[:12])}"
-                + ("…" if len(col_names) > 12 else "")
-                if col_names
-                else "字段列表可在后续分析步骤中确认。"
+            col_hint = ", ".join(col_names[:12]) if col_names else "no column names available"
+            return (
+                f"[Mock chat]\nLoaded file: {filename} ({rows} rows, {cols} columns).\n"
+                f"Columns: {col_hint}\n\n"
+                f"Question: {message.strip()[:500]}\n\n"
+                "If you want an executable analysis, use `/task` followed by the analysis request."
             )
-            ctx = (
-                f"当前已加载数据文件 `{fname or 'unknown'}`"
-                f"（约 {rows} 行、{cols} 列）。{col_hint}"
-            )
-        else:
-            ctx = "目前还没有可用的表格结构信息；如需针对数据提问，请先通过回形针上传 CSV/Excel。"
-
         return (
-            f"（Mock 对话）{ctx}\n\n"
-            f"关于你的问题：{message.strip()[:500]}\n\n"
-            "建议：若要进行可执行的分析，请在聊天中输入 **`/task`** 加上你的分析需求，"
-            "系统会生成结构化计划供你确认后再运行。"
+            "[Mock chat]\nNo tabular file schema is loaded yet.\n\n"
+            f"Question: {message.strip()[:500]}\n\n"
+            "Attach a CSV or Excel file first, then use `/task` to generate a structured plan."
         )
 
     async def revise_plan(
@@ -150,16 +162,135 @@ class MockProvider:
         schema_profile: dict,
         task_id: str = "mock",
     ) -> AnalysisPlan:
+        self.last_raw_skill_plan = None
         data = current_plan.model_dump()
-        short = instruction.strip()[:300] or "用户修订"
-        data["goal"] = f"{data.get('goal', '')} · 修订：{short}"
-        amb = list(data.get("ambiguities") or [])
-        amb.append({"field": "revision", "issue": short})
-        data["ambiguities"] = amb
-        conf = data.get("confidence")
-        if conf is not None:
-            data["confidence"] = round(max(0.0, min(1.0, float(conf) - 0.05)), 2)
-        return AnalysisPlan.model_validate(data)
+        short = instruction.strip()[:300] or "user revision"
+        data["goal"] = f"{data.get('goal', '')} | revised: {short}"
+
+        ambiguities = list(data.get("ambiguities") or [])
+        ambiguities.append({"field": "revision", "issue": short})
+        data["ambiguities"] = ambiguities
+
+        completeness = dict(data.get("completeness") or {})
+        completeness["status"] = PlanCompletenessStatus.NEEDS_EXPLORATION.value
+        completeness["rationale"] = (
+            "Plan was revised from user feedback and should be re-checked for completeness."
+        )
+        completeness["score"] = round(
+            max(0.0, min(1.0, float(completeness.get("score", 0.8)) - 0.05)),
+            2,
+        )
+        open_questions = list(completeness.get("open_questions") or [])
+        open_questions.append(
+            {
+                "question": f"Does the revision '{short}' change metric, filter, or grouping semantics?",
+                "reason": "User feedback changed the plan and may invalidate prior assumptions.",
+                "blocking": False,
+                "priority": ExplorationPriority.MEDIUM.value,
+                "related_fields": ["goal", "metrics", "dimensions", "filters"],
+            }
+        )
+        completeness["open_questions"] = open_questions
+        missing_information = list(completeness.get("missing_information") or [])
+        missing_information.extend(ambiguities[-1:])
+        completeness["missing_information"] = missing_information
+        data["completeness"] = completeness
+
+        confidence = data.get("confidence")
+        if confidence is not None:
+            data["confidence"] = round(
+                max(0.0, min(1.0, float(confidence) - 0.05)),
+                2,
+            )
+        parsed, raw_skill = parse_plan_payload(data)
+        self.last_raw_skill_plan = raw_skill
+        return parsed
+
+    @staticmethod
+    def _build_assumptions(
+        metric_col: str,
+        time_col: str | None,
+    ) -> list[PlanAssumptionSpec]:
+        assumptions = [
+            PlanAssumptionSpec(
+                statement=f"Use '{metric_col}' as the primary metric.",
+                impact="If this metric is not intended, aggregate results will not answer the real question.",
+            )
+        ]
+        if time_col:
+            assumptions.append(
+                PlanAssumptionSpec(
+                    statement=f"Use '{time_col}' as the primary time axis.",
+                    impact="Trend and recency analysis depend on this column representing business time.",
+                )
+            )
+        return assumptions
+
+    @staticmethod
+    def _build_completeness(
+        question: str,
+        ambiguities: list[AmbiguitySpec],
+        time_col: str | None,
+        category_col: str | None,
+    ) -> PlanCompletenessSpec:
+        if not ambiguities:
+            return PlanCompletenessSpec()
+
+        status = PlanCompletenessStatus.NEEDS_EXPLORATION
+        score = 0.75
+        open_questions: list[PlanQuestionSpec] = []
+        exploration_tasks: list[ExplorationTaskSpec] = []
+
+        if not time_col and any(
+            kw in question.lower() for kw in ("trend", "recent", "time", "latest")
+        ):
+            status = PlanCompletenessStatus.BLOCKED
+            score = 0.45
+            open_questions.append(
+                PlanQuestionSpec(
+                    question="Which column should be used as the time dimension?",
+                    reason="The request implies time-based analysis but no time column was confidently detected.",
+                    blocking=True,
+                    priority=ExplorationPriority.HIGH,
+                    related_fields=["dimensions"],
+                )
+            )
+
+        if not category_col:
+            open_questions.append(
+                PlanQuestionSpec(
+                    question="Is a categorical split needed, or is a single aggregate acceptable?",
+                    reason="No obvious category dimension was identified.",
+                    blocking=False,
+                    priority=ExplorationPriority.MEDIUM,
+                    related_fields=["dimensions", "output"],
+                )
+            )
+
+        exploration_tasks.append(
+            ExplorationTaskSpec(
+                goal="Validate whether the chosen metric and dimensions match the user's business intent.",
+                rationale="Fallback selections were used for part of the draft plan.",
+                priority=ExplorationPriority.MEDIUM,
+                inputs=["question", "schema_profile", "current plan draft"],
+                success_criteria=[
+                    "Primary metric is confirmed",
+                    "Grouping dimensions are confirmed or adjusted",
+                ],
+            )
+        )
+
+        return PlanCompletenessSpec(
+            status=status,
+            score=score,
+            rationale=(
+                "The draft plan is executable, but some fields were inferred and should be explored "
+                "before autonomous task execution."
+            ),
+            missing_information=ambiguities,
+            open_questions=open_questions,
+            exploration_tasks=exploration_tasks,
+        )
 
     @staticmethod
     def _assess_confidence(
@@ -194,7 +325,9 @@ class MockProvider:
             )
             score -= 0.1
 
-        has_time_keyword = any(kw in question for kw in ("趋势", "变化", "trend", "月", "季"))
+        has_time_keyword = any(
+            kw in question.lower() for kw in ("trend", "change", "recent", "latest", "time")
+        )
         if has_time_keyword and not time_col:
             ambiguities.append(
                 AmbiguitySpec(
@@ -206,7 +339,7 @@ class MockProvider:
 
         if filters:
             score += 0.05
-        elif any(kw in question for kw in ("华东", "华南", "华北", "只看", "排除")):
+        elif any(kw in question.lower() for kw in ("east", "west", "north", "south", "only", "exclude")):
             ambiguities.append(
                 AmbiguitySpec(
                     field="filters",

@@ -1,0 +1,108 @@
+{
+  "goal": {
+    "question": "Analyze monthly revenue by region and identify the top performing regions in Q1 2026.",
+    "decision_context": "Support a regional performance review for Q1 2026.",
+    "success_criteria": "Show which regions contribute the most revenue each month and overall in the quarter."
+  },
+  "scope": {
+    "entity": "order",
+    "population": "Orders recorded in Q1 2026.",
+    "assumptions": [
+      "Each row represents one order.",
+      "Revenue is stored in the revenue column."
+    ]
+  },
+  "analysis_type": "ranking",
+  "grain": {
+    "primary_key": ["order_id"],
+    "answer_unit": "region-month",
+    "aggregation_level": "month by region"
+  },
+  "metrics": [
+    {
+      "name": "total_revenue",
+      "column": "revenue",
+      "aggregation": "sum",
+      "definition": "Total revenue aggregated from order rows.",
+      "format": "currency",
+      "constraints": []
+    }
+  ],
+  "dimensions": [
+    {
+      "column": "region",
+      "role": "geo",
+      "label": "Region",
+      "reason": "Revenue needs to be compared across regions."
+    }
+  ],
+  "filters": [
+    {
+      "column": "order_date",
+      "operator": "gte",
+      "value": "2026-01-01",
+      "required": true
+    },
+    {
+      "column": "order_date",
+      "operator": "lt",
+      "value": "2026-04-01",
+      "required": true
+    }
+  ],
+  "segments": [],
+  "time": {
+    "time_column": "order_date",
+    "grain": "month",
+    "window": "2026-Q1",
+    "comparison_window": null
+  },
+  "derived_fields": [],
+  "comparisons": [
+    {
+      "type": "top_regions",
+      "left": "all regions",
+      "right": "top ranked regions by month",
+      "metric_names": ["total_revenue"],
+      "expected_signal": "Identify which regions consistently lead revenue."
+    }
+  ],
+  "methods": [
+    {
+      "name": "aggregate_revenue_by_region_month",
+      "type": "timeseries",
+      "inputs": ["order_date", "region", "revenue"],
+      "description": "Aggregate revenue by month and region for the Q1 window."
+    },
+    {
+      "name": "rank_regions",
+      "type": "top_n",
+      "inputs": ["total_revenue", "region"],
+      "description": "Rank regions by total revenue within each month and for the quarter overall."
+    }
+  ],
+  "validation": {
+    "data_quality_checks": [
+      "Check for null order_date values.",
+      "Check for null revenue values.",
+      "Check for duplicate order_id values."
+    ],
+    "metric_sanity_checks": [
+      "Revenue totals should be non-negative.",
+      "Monthly totals should sum to the quarterly total."
+    ],
+    "coverage_checks": [
+      "Schema contains time, geography, and revenue fields needed for the requested analysis."
+    ]
+  },
+  "output": {
+    "table_fields": ["month", "region", "total_revenue", "rank"],
+    "chart_type": "bar",
+    "title": "Top regions by monthly revenue in Q1 2026",
+    "sort": ["month asc", "total_revenue desc"],
+    "limit": 10,
+    "narrative_focus": "Highlight which regions lead revenue and whether leadership changes month to month."
+  },
+  "ambiguities": [],
+  "confidence": 0.93
+}

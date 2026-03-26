@@ -1,0 +1,38 @@
+{
+  "goal": {
+    "question": "",
+    "decision_context": "Support a regional performance review for Q1 2026.",
+    "success_criteria": "Show top performing regions."
+  },
+  "scope": {
+    "entity": "order",
+    "population": "",
+    "assumptions": []
+  },
+  "analysis_type": "ranking",
+  "grain": {
+    "primary_key": ["order_id"],
+    "answer_unit": "",
+    "aggregation_level": "month by region"
+  },
+  "metrics": [],
+  "dimensions": [],
+  "filters": [],
+  "segments": [],
+  "time": {},
+  "derived_fields": [],
+  "comparisons": [],
+  "methods": [],
+  "validation": {
+    "data_quality_checks": [],
+    "metric_sanity_checks": [],
+    "coverage_checks": []
+  },
+  "output": {
+    "table_fields": [],
+    "chart_type": "bar",
+    "title": "Broken plan"
+  },
+  "ambiguities": [],
+  "confidence": 0.5
+}

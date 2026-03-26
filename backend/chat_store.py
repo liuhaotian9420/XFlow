@@ -189,6 +189,49 @@ def list_session_turns(session_id: str, limit: int = 200) -> list[dict[str, Any]
     return [dict(r) for r in rows]
 
 
+def recent_codex_exec_samples(
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    limit: int = 40,
+) -> list[float]:
+    clauses = [
+        "use_mock = 0",
+        "is_fallback = 0",
+        "codex_exec_elapsed_s IS NOT NULL",
+        "codex_exec_elapsed_s > 0",
+    ]
+    params: list[Any] = []
+    if (model or "").strip():
+        clauses.append("model = ?")
+        params.append((model or "").strip())
+    if (reasoning_effort or "").strip():
+        clauses.append("reasoning_effort = ?")
+        params.append((reasoning_effort or "").strip())
+    where_sql = " AND ".join(clauses)
+    params.append(int(limit))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT codex_exec_elapsed_s
+            FROM chat_turns
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+    out: list[float] = []
+    for row in rows:
+        try:
+            value = float(row["codex_exec_elapsed_s"])
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out.append(value)
+    return out
+
+
 def delete_session(session_id: str) -> int:
     with _connect() as conn:
         conn.execute("DELETE FROM chat_turns WHERE session_id = ?", (session_id,))
