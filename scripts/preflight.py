@@ -37,7 +37,12 @@ def main() -> int:
     mode = str(status["app_mode"])
     codex_ready = bool(status["codex"]["ready"])
     odps_ready = bool(status["odps"]["ready"])
-    ok = mode == APP_MODE_MOCK or (codex_ready and odps_ready)
+    if args.mode == APP_MODE_REAL:
+        ok = mode == APP_MODE_REAL and codex_ready and odps_ready
+    elif args.mode == APP_MODE_MOCK:
+        ok = mode == APP_MODE_MOCK
+    else:
+        ok = mode == APP_MODE_MOCK or (codex_ready and odps_ready)
 
     if args.json:
         print(json.dumps({"ok": ok, **status}, ensure_ascii=False, indent=2))

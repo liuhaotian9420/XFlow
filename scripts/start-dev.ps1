@@ -2,11 +2,14 @@ param(
     [ValidateSet("demo", "real")]
     [string]$Mode = "demo",
     [string]$ApiBaseUrl = "http://127.0.0.1:8000",
+    [int]$FrontendPort = 8501,
     [switch]$NoReload,
     [switch]$SkipSync
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "launch-common.ps1")
 
 Write-Host "start-dev.ps1 is deprecated. Use start-demo.ps1 or start-real.ps1."
 
@@ -16,8 +19,9 @@ $scriptPath = if ($Mode -eq "real") {
 } else {
     Join-Path $PSScriptRoot "start-demo.ps1"
 }
+$shellCommand = Get-LauncherShellCommand
 
-$args = @("-ApiBaseUrl", $ApiBaseUrl)
+$args = @("-ApiBaseUrl", $ApiBaseUrl, "-FrontendPort", $FrontendPort)
 if ($NoReload.IsPresent) {
     $args += "-NoReload"
 }
@@ -25,4 +29,4 @@ if ($SkipSync.IsPresent) {
     $args += "-SkipSync"
 }
 
-& powershell -ExecutionPolicy Bypass -File $scriptPath @args
+& $shellCommand -ExecutionPolicy Bypass -File $scriptPath @args

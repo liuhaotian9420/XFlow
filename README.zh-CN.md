@@ -1,103 +1,221 @@
 # xyf-competition-mvp
 
-> [English](README.md)
+> 主 README 在这里：[README.md](README.md)
 
-一个自然语言驱动的数据分析工作台。上传 CSV/Excel 后，可自由聊天，也可用 `/task` 走结构化流程：计划 → 审阅 → 执行 → 结果。
+这份手册的目标只有一个：
 
-当前后端仅保留两种模式：
-- `MockProvider`（离线、确定性）
-- `LegacyCodexProvider`（真实 `codex exec`）
+让第一次接手项目的人，在新的 Windows 电脑上，把正式版 `real` 模式跑起来。
 
-## 快速开始
+## 先记住正式启动命令
 
-### 1. 安装依赖
-
-```bash
-uv sync
+```powershell
+.\scripts\start-real.ps1
 ```
 
-### 2. 启动后端
+启动成功后，你应该能打开：
 
-```bash
-# macOS / Linux
-uv run uvicorn backend.main:app --reload
+- 前端：`http://localhost:8501`
+- 后端：`http://127.0.0.1:8000`
+- 文档：`http://127.0.0.1:8000/docs`
 
-# Windows（强制 ProactorEventLoop，保证子进程管道可用）
-uv run uvicorn backend.main:app --reload --loop backend.loop_factory:proactor_loop_factory
-# 或：
-uv run python scripts/run_uvicorn_windows.py --reload
+## 正式版依赖什么
+
+你至少要准备好这些东西：
+
+- Git
+- Python 3.12+
+- uv
+- 项目代码
+- `.env`
+- Codex CLI
+- ODPS 配置
+
+## 从零开始操作
+
+### 1. 安装 Git
+
+打开：
+
+`https://git-scm.com/download/win`
+
+安装完成后，在 PowerShell 输入：
+
+```powershell
+git --version
 ```
 
-后端：`http://127.0.0.1:8000`  
-文档：`http://127.0.0.1:8000/docs`
+### 2. 安装 Python 3.12+
 
-### 3. 启动前端
+打开：
 
-```bash
-uv run streamlit run app/streamlit_app.py
+`https://www.python.org/downloads/windows/`
+
+安装时一定勾选：
+
+`Add python.exe to PATH`
+
+安装完成后，在 PowerShell 输入：
+
+```powershell
+python --version
 ```
 
-前端：`http://localhost:8501`
+### 3. 安装 uv
 
-## 运行时选择
+在 PowerShell 输入：
 
-`backend.codex.factory.get_provider()` 按请求选择：
-- `CODEX_MOCK=true`（默认）→ `MockProvider`
-- `CODEX_MOCK=false` → `LegacyCodexProvider`（`codex exec`）
-
-另外 `/chat`、`/tasks`、`/tasks/{id}/revise`、`/tasks/{id}/review` 支持按请求覆盖：
-- `model`
-- `reasoning_effort`（别名：`think_level`）
-
-调试 chat 时，`/chat` 还支持：
-- `include_prompt_debug=true`（返回实际渲染后的 prompt 与元信息）
-
-Chat 持久化：
-- SQLite 路径：`CHAT_SQLITE_PATH`（默认 `artifacts/chat_sessions.sqlite3`）
-- 查询会话：`GET /chat/sessions`
-- 查询会话明细：`GET /chat/sessions/{session_id}/turns`
-
-## 关键环境变量
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `CODEX_MOCK` | `true` | 为真时走 mock。 |
-| `CODEX_BINARY` | 自动 | `codex.exe` / `codex` 绝对路径。 |
-| `CODEX_CLI_COMMAND` | 未设置 | 可选命令/路径覆盖。 |
-| `XINFEI_CODEX_BINARY` | 未设置 | 可选信飞 Codex 绝对路径（用于回退解析）。 |
-| `XINFEI_CODEX_HOME` | 未设置 | 可选信飞安装根目录，后端会解析 `<home>/bin/codex(.exe)`。 |
-| `XINFEI_CODEX_PREFER` | `false` | 当 PATH 与 Xinfei 同时可用时，是否优先使用 Xinfei。 |
-| `CODEX_MODEL` | 未设置 | 可选模型覆盖（如 `gpt-5.4-mini`、`gpt-5.4-nano`）。 |
-| `CODEX_REASONING_EFFORT` | 未设置 | 可选推理强度覆盖（`low`/`medium`/`high`）。 |
-| `CODEX_THINK_LEVEL` | 未设置 | `CODEX_REASONING_EFFORT` 的别名。 |
-| `CODEX_TIMEOUT_SECONDS` | `180` | `codex exec` 超时秒数。 |
-| `CODEX_ASYNC_SUBPROCESS` | `true` | 使用 asyncio 子进程路径调用 Codex（可输出更细粒度时间拆解）。 |
-| `CODEX_DISABLE_MCP` | `true` | 是否在后端 `codex exec` 调用中禁用 MCP 启动（可降低每次调用开销）。 |
-| `CODEX_MCP_DISABLE_SERVERS` | `notion,linear,figma,playwright` | 当前后端路径已弃用该项；`CODEX_DISABLE_MCP=true` 会直接注入 `mcp_servers={}`，以规避 CLI 的 transport 解析报错。 |
-| `CODEX_RETRY_COUNT` | `1` | 计划/改计划解析失败时重试次数。 |
-| `CODEX_AUTO_MOCK_THRESHOLD` | `3` | 真实模式连续失败达到阈值后自动降级 mock。 |
-| `CODEX_HTTP_TRANSPORT_ONLY` | `true` | 注入 Codex 的 HTTP/SSE 配置覆盖。 |
-| `CODEX_SSE_PROVIDER_ID` | `openai_sse` | 配置覆盖使用的 provider id。 |
-| `CODEX_EXTRA_CONFIG` | 空 | 额外 `codex -c` 配置，分号分隔。 |
-| `XINFEI_CODEX_ENFORCE_SSO` | `false` | 未登录信飞企业 SSO 时直接失败。 |
-| `XINFEI_CODEX_AUTO_LOGIN` | `false` | 未登录时尝试交互式 `codex login --enterprise-sso`。 |
-| `STREAMLIT_CHAT_TIMEOUT_SECONDS` | `300` | 关闭 mock 后 `/chat` 请求超时秒数。 |
-| `API_BASE_URL` | `http://127.0.0.1:8000` | Streamlit 使用的后端地址。 |
-
-## 技能
-
-仓库技能位于 `.agents/skills/*/SKILL.md`。
-- `GET /skills` 可查看已发现的技能元数据。
-- 运行时依赖 Codex 原生 skills discovery/progressive disclosure。
-- 规划/对话/改计划提示词仅传短显式 hint（例如 `$analysis-planner`），不再注入技能全文。
-
-## 回归测试
-
-```bash
-uv run python tests/run_regression.py --mode mock
-uv run python tests/run_regression.py --mode real
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-## 架构文档
+然后关闭 PowerShell，再重新打开，输入：
 
-详见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)。
+```powershell
+uv --version
+```
+
+### 4. 获取代码
+
+如果你有仓库地址，输入：
+
+```powershell
+git clone <仓库地址>
+cd xyf-competition-mvp
+```
+
+### 5. 如果脚本不能运行
+
+在 PowerShell 输入：
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+如果系统提示确认，输入 `Y`。
+
+### 6. 创建 `.env`
+
+进入项目根目录后，输入：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+### 7. 填写 `.env`
+
+至少填写这些：
+
+```env
+APP_MODE=real
+API_BASE_URL=http://127.0.0.1:8000
+CODEX_CLI_COMMAND=
+CODEX_BINARY=
+CODEX_MODEL=
+CODEX_REASONING_EFFORT=
+ODPS_ACCESS_KEY_ID=
+ODPS_ACCESS_KEY_SECRET=
+ODPS_PROJECT=
+ODPS_ENDPOINT=
+```
+
+如果你不知道这些值是什么，就去问项目负责人或环境交接人。
+
+### 8. 检查正式环境
+
+在 PowerShell 输入：
+
+```powershell
+uv run python scripts/preflight.py --mode real
+```
+
+只有这一步执行成功，并且输出里明确看到：
+
+```text
+APP_MODE: real
+```
+
+才说明正式环境真的基本配好了。
+
+如果这一步报错，先修报错，不要直接启动。
+
+### 9. 正式启动
+
+在 PowerShell 输入：
+
+```powershell
+.\scripts\start-real.ps1
+```
+
+## 如果失败怎么办
+
+### 找不到 Python
+
+重新安装 Python，并勾选：
+
+`Add python.exe to PATH`
+
+### 找不到 uv
+
+重新安装 `uv`，然后重新打开 PowerShell。
+
+### 找不到 `.env`
+
+执行：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+### `preflight` 失败
+
+说明 Codex 或 ODPS 配置还没好。
+
+先修 `.env`，再执行：
+
+```powershell
+uv run python scripts/preflight.py --mode real
+```
+
+并确认输出里是：
+
+```text
+APP_MODE: real
+```
+
+### PowerShell 不允许执行脚本
+
+执行：
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+### 页面打不开
+
+先看启动时弹出来的 PowerShell 窗口，错误通常在那里。
+
+### 端口被占用
+
+关闭占用 `8000` 或 `8501` 的旧程序，再重新启动。
+
+## Demo 只用于排障
+
+`demo` 不是正式入口。
+
+只有你怀疑是本机环境问题时，才临时执行：
+
+```powershell
+.\scripts\start-demo.ps1
+```
+
+正式交付、正式验收、正式演示，都以 `real` 模式为准。
+
+## 最后记住这几个命令
+
+```powershell
+python --version
+uv --version
+Copy-Item .env.example .env
+uv run python scripts/preflight.py --mode real
+.\scripts\start-real.ps1
+```

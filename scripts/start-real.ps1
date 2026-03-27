@@ -1,23 +1,20 @@
 param(
     [string]$ApiBaseUrl = "http://127.0.0.1:8000",
+    [int]$FrontendPort = 8501,
     [switch]$NoReload,
     [switch]$SkipSync
 )
 
 $ErrorActionPreference = "Stop"
 
-function Test-CommandExists {
-    param([string]$Name)
-    return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
-}
+. (Join-Path $PSScriptRoot "launch-common.ps1")
 
 function Invoke-RequiredToolCheck {
-    if (-not (Test-CommandExists "python")) {
-        throw "Python is not installed or not on PATH. Install Python 3.12+ first."
-    }
-    if (-not (Test-CommandExists "uv")) {
-        throw "uv is not installed or not on PATH. Install uv first."
-    }
+    $pythonVersion = Assert-MinimumVersion -Name "python" -MinimumVersion ([Version]"3.12.0") -InstallHint "Install Python 3.12+ first."
+    Install-UvIfMissing | Out-Null
+    $uvVersion = Assert-MinimumVersion -Name "uv" -MinimumVersion ([Version]"0.4.0") -InstallHint "Install uv first."
+    Write-Host "[ok] python $pythonVersion"
+    Write-Host "[ok] uv $uvVersion"
 }
 
 function Invoke-UvSyncIfNeeded {
@@ -40,6 +37,10 @@ function Start-WindowProcess {
     param(
         [string]$ProjectRoot,
         [string]$ApiBaseUrl,
+        [string]$ShellCommand,
+        [string]$BackendHost,
+        [int]$BackendPort,
+        [int]$FrontendPort,
         [bool]$Reload,
         [string]$Target
     )
@@ -54,35 +55,37 @@ function Start-WindowProcess {
 Set-Location '$ProjectRoot'
 `$env:APP_MODE='real'
 `$env:API_BASE_URL='$ApiBaseUrl'
-uv run python scripts/run_uvicorn_windows.py$reloadFlag
+uv run python scripts/run_uvicorn_windows.py --host '$BackendHost' --port $BackendPort$reloadFlag
 "@
     } else {
         $command = @"
 Set-Location '$ProjectRoot'
 `$env:APP_MODE='real'
 `$env:API_BASE_URL='$ApiBaseUrl'
-uv run streamlit run app/streamlit_app.py
+uv run streamlit run app/streamlit_app.py --server.port $FrontendPort
 "@
     }
 
-    Start-Process powershell -ArgumentList "-NoExit", "-Command", $command | Out-Null
+    Start-Process $ShellCommand -ArgumentList "-NoExit", "-Command", $command | Out-Null
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$envFile = Join-Path $projectRoot ".env"
 $reload = -not $NoReload.IsPresent
+$apiEndpoint = Resolve-ApiEndpoint -ApiBaseUrl $ApiBaseUrl
+$shellCommand = Get-LauncherShellCommand
 
 Write-Host "xyf-competition-mvp real launcher"
 Write-Host "project root: $projectRoot"
 Write-Host "mode: real"
 Write-Host "api base url: $ApiBaseUrl"
+Write-Host "launcher shell: $shellCommand"
+Write-Host "frontend port: $FrontendPort"
 
 Set-Location $projectRoot
 Invoke-RequiredToolCheck
-
-if (-not (Test-Path $envFile)) {
-    throw ".env not found at project root. Copy .env.example to .env and fill in your Codex and ODPS settings first."
-}
+Initialize-EnvFile -ProjectRoot $projectRoot -RequireRealSettings $true | Out-Null
+Assert-PortAvailable -Port $apiEndpoint.Port -Label "Backend"
+Assert-PortAvailable -Port $FrontendPort -Label "Frontend"
 
 Invoke-UvSyncIfNeeded -ProjectRoot $projectRoot -Skip $SkipSync.IsPresent
 
@@ -92,9 +95,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "Preflight failed. Fix the reported Codex or ODPS configuration before retrying."
 }
 
-Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -Reload $reload -Target "backend"
-Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -Reload $reload -Target "frontend"
+Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "backend"
+Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "frontend"
 
 Write-Host "Launched real mode."
 Write-Host "Backend:  $ApiBaseUrl"
-Write-Host "Frontend: http://localhost:8501"
+Write-Host "Frontend: http://localhost:$FrontendPort"
