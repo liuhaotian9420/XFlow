@@ -152,6 +152,60 @@ function Test-LocalPortAvailable {
     }
 }
 
+function Test-TcpEndpointReady {
+    param(
+        [string]$Host,
+        [int]$Port,
+        [int]$TimeoutMilliseconds = 1000
+    )
+
+    $client = $null
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $asyncResult = $client.BeginConnect($Host, $Port, $null, $null)
+        if (-not $asyncResult.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) {
+            return $false
+        }
+        $client.EndConnect($asyncResult)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $client) {
+            $client.Dispose()
+        }
+    }
+}
+
+function Wait-TcpEndpointReady {
+    param(
+        [string]$Host,
+        [int]$Port,
+        [string]$Label,
+        [System.Diagnostics.Process]$Process = $null,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ($null -ne $Process) {
+            $Process.Refresh()
+            if ($Process.HasExited) {
+                throw "$Label exited before becoming ready."
+            }
+        }
+
+        if (Test-TcpEndpointReady -Host $Host -Port $Port) {
+            Write-Host "[ok] $Label is listening on $Host`:$Port"
+            return
+        }
+
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "$Label did not become ready on $Host`:$Port within $TimeoutSeconds seconds."
+}
+
 function Get-PortConflictHint {
     param([int]$Port)
 

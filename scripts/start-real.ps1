@@ -66,7 +66,7 @@ uv run streamlit run app/streamlit_app.py --server.port $FrontendPort
 "@
     }
 
-    Start-Process $ShellCommand -ArgumentList "-NoExit", "-Command", $command | Out-Null
+    return Start-Process $ShellCommand -ArgumentList "-NoExit", "-Command", $command -PassThru
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -96,8 +96,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "Preflight failed. Fix the reported Codex or ODPS configuration before retrying."
 }
 
-Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "backend"
-Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "frontend"
+$backendProcess = Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "backend"
+$frontendProcess = Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "frontend"
+
+Wait-TcpEndpointReady -Host $apiEndpoint.Host -Port $apiEndpoint.Port -Label "Backend" -Process $backendProcess
+Wait-TcpEndpointReady -Host "127.0.0.1" -Port $FrontendPort -Label "Frontend" -Process $frontendProcess
 
 Write-Host "Launched real mode."
 Write-Host "Backend:  $ApiBaseUrl"

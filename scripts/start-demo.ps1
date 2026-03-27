@@ -67,7 +67,7 @@ uv run streamlit run app/streamlit_app.py --server.port $FrontendPort
 "@
     }
 
-    Start-Process $ShellCommand -ArgumentList "-NoExit", "-Command", $command | Out-Null
+    return Start-Process $ShellCommand -ArgumentList "-NoExit", "-Command", $command -PassThru
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -89,8 +89,11 @@ Assert-PortAvailable -Port $apiEndpoint.Port -Label "Backend"
 Assert-PortAvailable -Port $FrontendPort -Label "Frontend"
 Invoke-UvSyncIfNeeded -ProjectRoot $projectRoot -Skip $SkipSync.IsPresent
 
-Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -AppMode "mock" -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "backend"
-Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -AppMode "mock" -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "frontend"
+$backendProcess = Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -AppMode "mock" -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "backend"
+$frontendProcess = Start-WindowProcess -ProjectRoot $projectRoot -ApiBaseUrl $ApiBaseUrl -AppMode "mock" -ShellCommand $shellCommand -BackendHost $apiEndpoint.Host -BackendPort $apiEndpoint.Port -FrontendPort $FrontendPort -Reload $reload -Target "frontend"
+
+Wait-TcpEndpointReady -Host $apiEndpoint.Host -Port $apiEndpoint.Port -Label "Backend" -Process $backendProcess
+Wait-TcpEndpointReady -Host "127.0.0.1" -Port $FrontendPort -Label "Frontend" -Process $frontendProcess
 
 Write-Host "Launched demo mode."
 Write-Host "Backend:  $ApiBaseUrl"
