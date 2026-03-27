@@ -1,8 +1,21 @@
 
 .venv
 __pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
+*.pyd
 artifacts/
+.pytest_cache/
+*.sqlite3
+*.db
+*.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tmp
+tmp_*
 
 # E2E / local DuckDB under skills assets (keep directory via .gitkeep only)
 .agents/assets/*
@@ -15,6 +28,8 @@ notes/
 tmp_files/
 tmp_files2/
 tmp_smoke.sql
+.env
+.DS_Store
 
 # Never commit credentials or skill run scratch
 .agents/skills/**/scripts/.env
