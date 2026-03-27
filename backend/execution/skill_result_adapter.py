@@ -1,8 +1,7 @@
-"""Adapt skill-produced files into the existing ``ResultPayload`` shape."""
+"""Adapt skill-produced files into a reference-first ``ResultPayload`` shape."""
 
 from __future__ import annotations
 
-import base64
 import csv
 import json
 from pathlib import Path
@@ -12,7 +11,7 @@ from backend.schemas.plan import ChartType
 from backend.schemas.result import ArtifactPayload, ChartPayload, ResultPayload, TablePayload
 
 _MAX_ARTIFACT_BYTES = 1_000_000
-_TEXT_EXTS = {".json", ".csv", ".txt", ".sql", ".md"}
+_TEXT_EXTS = {".json", ".csv", ".txt", ".sql", ".md", ".html", ".htm"}
 _BINARY_EXT_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -31,6 +30,7 @@ _PRIORITY_FILES = (
     "breaks_export.json",
     "scored_test.csv",
 )
+_ALLOWED_ARTIFACT_ROOTS = ("artifacts", "tmp_files")
 
 
 def _normalize_dir(path: str, *, repo_root: Path) -> Path:
@@ -118,18 +118,27 @@ def _build_run_summary_table(run_summary_json: dict[str, Any]) -> TablePayload |
     return TablePayload(columns=["key", "value"], rows=rows)
 
 
-def _make_artifact(path: Path, *, root: Path) -> ArtifactPayload | None:
+def _repo_relative_artifact_path(path: Path, *, repo_root: Path) -> str | None:
+    try:
+        rel = path.resolve().relative_to(repo_root.resolve())
+    except Exception:
+        return None
+    rel_s = str(rel).replace("\\", "/")
+    top = rel_s.split("/", 1)[0] if rel_s else ""
+    if top not in _ALLOWED_ARTIFACT_ROOTS:
+        return None
+    return rel_s
+
+
+def _make_artifact(path: Path, *, root: Path, repo_root: Path) -> ArtifactPayload | None:
     rel_name = str(path.relative_to(root)).replace("\\", "/")
+    rel_repo_path = _repo_relative_artifact_path(path, repo_root=repo_root)
+    if not rel_repo_path:
+        return None
     ext = path.suffix.lower()
     size = path.stat().st_size
     if size > _MAX_ARTIFACT_BYTES:
         return None
-    if ext == ".html":
-        try:
-            html = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-        return ArtifactPayload(name=rel_name, mime="text/html", html=html)
 
     mime = "application/octet-stream"
     if ext in _BINARY_EXT_MIME:
@@ -144,15 +153,9 @@ def _make_artifact(path: Path, *, root: Path) -> ArtifactPayload | None:
         mime = "text/plain"
     elif ext == ".md":
         mime = "text/markdown"
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return None
-    return ArtifactPayload(
-        name=rel_name,
-        mime=mime,
-        data_base64=base64.b64encode(raw).decode("ascii"),
-    )
+    elif ext in {".html", ".htm"}:
+        mime = "text/html"
+    return ArtifactPayload(name=rel_name, mime=mime, path=rel_repo_path)
 
 
 def enrich_result_with_skill_outputs(
@@ -181,7 +184,7 @@ def enrich_result_with_skill_outputs(
                 parsed = _safe_load_json(f)
                 if isinstance(parsed, dict):
                     fallback_table = _build_run_summary_table(parsed)
-            artifact = _make_artifact(f, root=root)
+            artifact = _make_artifact(f, root=root, repo_root=repo_root)
             if artifact is not None:
                 result.artifacts.append(artifact)
                 attached_count += 1

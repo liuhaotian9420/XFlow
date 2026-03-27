@@ -45,22 +45,31 @@ class SkillGalleryItem:
     prompt_hint: str
 
 
+@st.dialog("Sync GitLab")
+def _show_sync_gitlab_dialog() -> None:
+    st.info("敬请期待")
+    st.caption("GitLab 同步入口已预留，后续会在这里接入实际同步流程。")
+
+
 def render_skills_tab() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     skill_items = _collect_skill_items(repo_root)
 
-    st.markdown(
-        """
-        <div class="xyf-library-hero">
-            <div class="xyf-library-kicker">Knowledge Base</div>
-            <div class="xyf-library-title">Skills</div>
-            <div class="xyf-library-copy">
-                Browse local skills, inspect their purpose, and reuse them in the next conversation turn.
+    hero_col, action_col = st.columns([10, 0.1], gap="small", vertical_alignment="center")
+    with hero_col:
+        st.markdown(
+            """
+            <div class="xyf-library-hero">
+                <div class="xyf-library-kicker">Knowledge Base</div>
+                <div class="xyf-library-title">Skills</div>
+                <div class="xyf-library-copy">
+                    Browse local skills, inspect their purpose, and reuse them in the next conversation turn.
+                </div>
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
+
 
     _render_skill_section(skill_items)
 
@@ -365,7 +374,7 @@ def _render_skill_section(items: list[SkillGalleryItem]) -> None:
         st.info("No local skills found under `.agents/skills`.")
         return
 
-    search_col, category_col,pagination_col = st.columns([1.4, 1, 0.6], gap="small",vertical_alignment = 'bottom')
+    search_col, category_col,pagination_col,action_col = st.columns([1.2, 1, 0.6, 0.2], gap="small",vertical_alignment = 'bottom')
     with search_col:
         search = st.text_input("Search skills", key="skills_search_query", placeholder="planner, sql, verification...")
     with category_col:
@@ -392,7 +401,9 @@ def _render_skill_section(items: list[SkillGalleryItem]) -> None:
         if not paged_skills:
             st.info("No skills on this page.")
             return
-
+    with action_col:
+        if st.button("远程同步", key="skills_sync_gitlab", width = 'content', type="primary"):
+            _show_sync_gitlab_dialog()
     # st.markdown(
     #     """
     #     <div class="xyf-library-hero">

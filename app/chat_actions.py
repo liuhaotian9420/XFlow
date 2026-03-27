@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import json
+import logging
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -27,6 +31,92 @@ from app.streamlit_state import (
     _chat_history_upto,
     _ensure_confirmation_review,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ARTIFACT_ALLOWED_ROOTS = {"artifacts", "tmp_files"}
+_LOG = logging.getLogger("xyf.chatdbg")
+
+
+def _safe_artifact_file(path_value: Any) -> Path | None:
+    if not isinstance(path_value, str):
+        return None
+    raw = path_value.strip().replace("\\", "/")
+    if not raw:
+        return None
+    candidate = (_REPO_ROOT / raw).resolve()
+    try:
+        rel = candidate.relative_to(_REPO_ROOT)
+    except ValueError:
+        return None
+    rel_s = str(rel).replace("\\", "/")
+    top = rel_s.split("/", 1)[0] if rel_s else ""
+    if top not in _ARTIFACT_ALLOWED_ROOTS:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def _hydrate_chat_artifacts(result_payload: dict[str, Any]) -> dict[str, Any]:
+    artifacts = result_payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        return result_payload
+
+    hydrated: list[dict[str, Any]] = []
+    changed = False
+    for item in artifacts:
+        if not isinstance(item, dict):
+            hydrated.append(item if isinstance(item, dict) else {})
+            continue
+        artifact = dict(item)
+        mime = str(artifact.get("mime") or "").strip().lower()
+        path = _safe_artifact_file(artifact.get("path"))
+        if path is not None:
+            # Prefer local file content over inline fields when path is present.
+            if mime == "text/html":
+                try:
+                    artifact["html"] = path.read_text(encoding="utf-8", errors="replace")
+                    _LOG.warning(
+                        "[CHATDBG][frontend][hydrate] mime=%s path=%s html_chars=%s",
+                        mime,
+                        str(artifact.get("path") or ""),
+                        len(str(artifact.get("html") or "")),
+                    )
+                    changed = True
+                except OSError:
+                    _LOG.warning(
+                        "[CHATDBG][frontend][hydrate][read_fail] mime=%s path=%s",
+                        mime,
+                        str(artifact.get("path") or ""),
+                    )
+                    pass
+            elif mime.startswith("image/"):
+                try:
+                    raw = path.read_bytes()
+                    artifact["data_base64"] = base64.b64encode(raw).decode("ascii")
+                    _LOG.warning(
+                        "[CHATDBG][frontend][hydrate] mime=%s path=%s image_bytes=%s",
+                        mime,
+                        str(artifact.get("path") or ""),
+                        len(raw),
+                    )
+                    changed = True
+                except OSError:
+                    _LOG.warning(
+                        "[CHATDBG][frontend][hydrate][read_fail] mime=%s path=%s",
+                        mime,
+                        str(artifact.get("path") or ""),
+                    )
+                    pass
+        else:
+            if mime == "text/html":
+                html = artifact.get("html")
+                if not (isinstance(html, str) and html.strip()):
+                    pass
+        hydrated.append(artifact)
+    if not changed:
+        return result_payload
+    return {**result_payload, "artifacts": hydrated}
 
 
 def _enqueue_task(question: str) -> None:
@@ -258,10 +348,65 @@ def _execute_chat_reply(msg: dict[str, Any], msg_index: int) -> None:
         timing = final_event.get("timing") if isinstance(final_event.get("timing"), dict) else {}
         usage = final_event.get("usage") if isinstance(final_event.get("usage"), dict) else {}
         reply = str(final_event.get("reply") or "").strip() or "(empty reply)"
+        content = reply
+        structured_result: dict[str, Any] | None = None
+        if reply.startswith("{") and reply.endswith("}"):
+            try:
+                parsed_reply = json.loads(reply)
+            except json.JSONDecodeError:
+                parsed_reply = None
+            if isinstance(parsed_reply, dict):
+                parsed_content = parsed_reply.get("reply")
+                parsed_result = parsed_reply.get("result")
+                _LOG.warning(
+                    "[CHATDBG][frontend][parse] reply_is_json=1 has_reply=%s has_result=%s keys=%s",
+                    isinstance(parsed_content, str),
+                    isinstance(parsed_result, dict),
+                    sorted(parsed_reply.keys()),
+                )
+                if isinstance(parsed_content, str) and parsed_content.strip():
+                    content = parsed_content
+                if isinstance(parsed_result, dict):
+                    structured_result = _hydrate_chat_artifacts(parsed_result)
+                    artifacts = structured_result.get("artifacts")
+                    _LOG.warning(
+                        "[CHATDBG][frontend][result] artifacts=%s has_chart=%s result_keys=%s",
+                        len(artifacts) if isinstance(artifacts, list) else 0,
+                        "chart" in structured_result,
+                        sorted(structured_result.keys()),
+                    )
+                    if (
+                        "chart" not in structured_result
+                        and "charts" not in structured_result
+                        and isinstance(artifacts, list)
+                        and len(artifacts) > 0
+                    ):
+                        # UI result card currently early-returns without `chart`.
+                        # Add a harmless placeholder chart so artifacts can still render.
+                        structured_result = {
+                            **structured_result,
+                            "chart": {
+                                "chart_type": "bar",
+                                "x": "_",
+                                "y": "_",
+                                "data": [],
+                            },
+                        }
+                        _LOG.warning(
+                            "[CHATDBG][frontend][result] inject_placeholder_chart=1 artifacts=%s",
+                            len(artifacts),
+                        )
+        else:
+            _LOG.warning(
+                "[CHATDBG][frontend][parse] reply_is_json=0 chars=%s",
+                len(reply),
+            )
         st.session_state.messages[msg_index] = {
             "role": "assistant",
             "type": "chat_response",
-            "content": reply,
+            "content": content,
+            "raw_content": reply,
+            "result": structured_result,
             "debug_prompt": final_event.get("debug_prompt"),
             "prompt_chars": final_event.get("prompt_chars"),
             "history_turns_used": len(history[-20:]),

@@ -38,6 +38,7 @@ from backend.skills import (
 )
 
 logger = logging.getLogger(__name__)
+_CHAT_OUTPUT_SCHEMA_PATH = Path(__file__).with_name("chat_output.schema.json")
 
 
 def _format_exception_for_logs(exc: BaseException, *, max_chain: int = 5) -> str:
@@ -143,6 +144,25 @@ def _codex_exec_permission_args() -> list[str]:
     if approval_policy and not bypass:
         parts_before_exec.extend(["-a", approval_policy])
     return [*parts_before_exec, "exec", *parts_after_exec]
+
+
+def _codex_chat_output_schema_args() -> list[str]:
+    """
+    Add ``--output-schema`` only for chat flows.
+
+    This keeps planner/reviser prompts on their current free-form JSON contract while
+    allowing chat-mode experiments with a structured final response.
+    """
+    enabled = os.getenv("CODEX_CHAT_USE_OUTPUT_SCHEMA", "true").strip().lower()
+    if enabled in ("0", "false", "no", "off"):
+        return []
+    if not _CHAT_OUTPUT_SCHEMA_PATH.exists():
+        logger.warning(
+            "Chat output schema file is missing; skipping --output-schema path=%s",
+            _CHAT_OUTPUT_SCHEMA_PATH,
+        )
+        return []
+    return ["--output-schema", str(_CHAT_OUTPUT_SCHEMA_PATH)]
 
 
 def _log_codex_exec_launch(argv: list[str]) -> None:
@@ -252,6 +272,28 @@ def _extract_last_agent_message_from_jsonl(raw: str) -> str:
         if text:
             last = text
     return last
+
+
+def _resolve_reply_from_json_mode(
+    *,
+    out_path: Path,
+    stdout_text: str,
+) -> str:
+    """
+    Resolve final reply text from JSON mode outputs.
+
+    Priority:
+    1) ``-o`` output file
+    2) last ``agent_message`` from JSONL stream
+    """
+    reply = ""
+    try:
+        reply = out_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        reply = ""
+    if reply:
+        return reply
+    return _extract_last_agent_message_from_jsonl(stdout_text)
 
 
 def _maybe_persist_jsonl_stream(stdout_text: str) -> None:
@@ -390,6 +432,23 @@ class LegacyCodexProvider:
     last_cached_input_tokens: int | None = None
     last_skill_hints: list[str] | None = None
     last_raw_skill_plan: dict | None = None
+    async_subprocess_supported: bool | None = None
+
+    def _should_try_async_subprocess(self) -> bool:
+        """
+        Decide whether to attempt asyncio subprocess APIs.
+
+        On Windows, Proactor/event-loop support can be inconsistent across runtimes.
+        Default to sync subprocess there unless explicitly enabled.
+        """
+        if self.async_subprocess_supported is False:
+            return False
+        raw = os.getenv("CODEX_ASYNC_SUBPROCESS", "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return sys.platform != "win32"
 
     async def generate_plan(
         self, question: str, schema_profile: dict, task_id: str = "unknown"
@@ -681,19 +740,16 @@ class LegacyCodexProvider:
         self.last_argv = tuple(argv)
         self.last_prompt_chars = len(prompt)
         started = time.perf_counter()
-        force_async = os.getenv("CODEX_ASYNC_SUBPROCESS", "true").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        use_async_subprocess = self._should_try_async_subprocess()
         try:
-            if sys.platform == "win32" and not force_async:
+            if not use_async_subprocess:
                 return await asyncio.to_thread(
                     _run_codex_subprocess_sync, argv, prompt, self.timeout_seconds
                 )
             try:
                 return await self._run_prompt_async_subprocess(argv, prompt)
             except (NotImplementedError, PermissionError):
+                self.async_subprocess_supported = False
                 return await asyncio.to_thread(
                     _run_codex_subprocess_sync, argv, prompt, self.timeout_seconds
                 )
@@ -729,6 +785,7 @@ class LegacyCodexProvider:
                 "--json",
                 "-o",
                 str(out_path),
+                *_codex_chat_output_schema_args(),
                 *_codex_exec_config_args(
                     model_override=self.model,
                     reasoning_override=self.reasoning_effort,
@@ -739,11 +796,7 @@ class LegacyCodexProvider:
             self.last_argv = tuple(argv)
             self.last_prompt_chars = len(prompt)
             started = time.perf_counter()
-            force_async = os.getenv("CODEX_ASYNC_SUBPROCESS", "true").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-            )
+            use_async_subprocess = self._should_try_async_subprocess()
             first_event_at: float | None = None
             turn_started_at: float | None = None
             first_agent_at: float | None = None
@@ -751,7 +804,7 @@ class LegacyCodexProvider:
             stdout_text = ""
             stderr_text = ""
             returncode = 0
-            if sys.platform == "win32" and not force_async:
+            if not use_async_subprocess:
                 # Keep the proven sync path on Windows; detailed phase timing may be unavailable.
                 try:
                     completed = await asyncio.to_thread(
@@ -855,6 +908,7 @@ class LegacyCodexProvider:
                         "utf-8", errors="ignore"
                     ).strip()
                 except (NotImplementedError, PermissionError):
+                    self.async_subprocess_supported = False
                     try:
                         completed = await asyncio.to_thread(
                             subprocess.run,
@@ -894,15 +948,20 @@ class LegacyCodexProvider:
                     f"Codex command failed (code={returncode}): {stderr_text}"
                 )
             usage = _extract_usage_from_jsonl(stdout_text)
-            reply = ""
-            try:
-                reply = out_path.read_text(encoding="utf-8", errors="replace").strip()
-            except OSError:
-                reply = ""
+            reply = _resolve_reply_from_json_mode(
+                out_path=out_path,
+                stdout_text=stdout_text,
+            )
             if not reply:
-                reply = _extract_last_agent_message_from_jsonl(stdout_text)
-            if not reply:
-                raise CodexAdapterError("Codex returned empty reply in JSON mode.")
+                # Last-resort fallback: run without JSON mode to avoid hard failure
+                # when upstream emits usage/events but no terminal agent message.
+                logger.warning(
+                    "JSON mode produced empty reply; falling back to plain exec argv=%r",
+                    argv,
+                )
+                reply = await self._run_prompt(prompt)
+                if not reply.strip():
+                    raise CodexAdapterError("Codex returned empty reply in JSON mode.")
             return reply, usage
         finally:
             try:
@@ -948,6 +1007,7 @@ class LegacyCodexProvider:
                 "--json",
                 "-o",
                 str(out_path),
+                *_codex_chat_output_schema_args(),
                 *_codex_exec_config_args(
                     model_override=self.model,
                     reasoning_override=self.reasoning_effort,
@@ -957,14 +1017,8 @@ class LegacyCodexProvider:
             _log_codex_exec_launch(argv)
             self.last_argv = tuple(argv)
             self.last_prompt_chars = len(prompt)
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            except (NotImplementedError, PermissionError):
+            use_async_subprocess = self._should_try_async_subprocess()
+            if not use_async_subprocess:
                 logger.warning(
                     "Streaming chat falling back to buffered sync subprocess chat_id=%s argv=%r",
                     chat_id,
@@ -1047,6 +1101,105 @@ class LegacyCodexProvider:
                     reply = _extract_last_agent_message_from_jsonl(stdout_text)
                 if not reply:
                     raise CodexAdapterError("Codex returned empty reply in JSON mode.")
+                yield {
+                    "type": "final",
+                    "chat_id": chat_id,
+                    "timestamp": time.time(),
+                    "reply": reply,
+                    "usage": usage or {},
+                    "timing": {
+                        "codex_exec_elapsed_s": self.last_exec_elapsed_s,
+                        "codex_spawn_elapsed_s": self.last_spawn_elapsed_s,
+                        "codex_ttft_elapsed_s": self.last_ttft_elapsed_s,
+                        "codex_generation_elapsed_s": self.last_generation_elapsed_s,
+                        "codex_teardown_elapsed_s": self.last_teardown_elapsed_s,
+                        "prompt_build_elapsed_s": self.last_chat_prompt_build_elapsed_s,
+                    },
+                    "prompt_chars": self.last_prompt_chars,
+                    "debug_prompt": self.last_chat_prompt_text,
+                    "skill_hints": self.last_skill_hints,
+                }
+                return
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except (NotImplementedError, PermissionError):
+                self.async_subprocess_supported = False
+                logger.warning(
+                    "Streaming chat async subprocess unsupported; using buffered sync chat_id=%s argv=%r",
+                    chat_id,
+                    argv,
+                )
+                completed = await asyncio.to_thread(
+                    subprocess.run,
+                    argv,
+                    input=prompt.encode("utf-8"),
+                    capture_output=True,
+                    timeout=self.timeout_seconds,
+                )
+                stdout_text = (completed.stdout or b"").decode("utf-8", errors="ignore")
+                stderr_text = (completed.stderr or b"").decode("utf-8", errors="ignore").strip()
+                returncode = int(
+                    completed.returncode if completed.returncode is not None else 0
+                )
+                for line in stdout_text.splitlines():
+                    observed_at = time.perf_counter()
+                    event = _safe_json_loads(line)
+                    if event is not None:
+                        etype = str(event.get("type") or "").strip()
+                        if first_event_at is None:
+                            first_event_at = observed_at
+                        if etype == "turn.started" and turn_started_at is None:
+                            turn_started_at = observed_at
+                        elif etype == "turn.completed":
+                            turn_completed_at = observed_at
+                        elif etype == "item.completed":
+                            item = event.get("item")
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "agent_message"
+                                and first_agent_at is None
+                            ):
+                                first_agent_at = observed_at
+                    normalized = _stream_event_from_jsonl(line=line, seq=seq, chat_id=chat_id)
+                    seq += 1
+                    if normalized is not None:
+                        yield normalized
+                self.last_exec_elapsed_s = time.perf_counter() - started
+                _maybe_persist_jsonl_stream(stdout_text)
+                _apply_jsonl_timing_fields(
+                    self,
+                    started=started,
+                    first_event_at=first_event_at,
+                    turn_started_at=turn_started_at,
+                    first_agent_at=first_agent_at,
+                    turn_completed_at=turn_completed_at,
+                )
+                if returncode != 0:
+                    raise CodexAdapterError(
+                        f"Codex command failed (code={returncode}): {stderr_text}"
+                    )
+                usage = _extract_usage_from_jsonl(stdout_text)
+                if usage is not None:
+                    self.last_input_tokens = usage.get("input_tokens")
+                    self.last_output_tokens = usage.get("output_tokens")
+                    self.last_cached_input_tokens = usage.get("cached_input_tokens")
+                reply = _resolve_reply_from_json_mode(
+                    out_path=out_path,
+                    stdout_text=stdout_text,
+                )
+                if not reply:
+                    logger.warning(
+                        "Streaming JSON mode produced empty reply; falling back to plain exec argv=%r",
+                        argv,
+                    )
+                    reply = await self._run_prompt(prompt)
+                    if not reply.strip():
+                        raise CodexAdapterError("Codex returned empty reply in JSON mode.")
                 yield {
                     "type": "final",
                     "chat_id": chat_id,
@@ -1155,20 +1308,23 @@ class LegacyCodexProvider:
                 self.last_input_tokens = usage.get("input_tokens")
                 self.last_output_tokens = usage.get("output_tokens")
                 self.last_cached_input_tokens = usage.get("cached_input_tokens")
-            reply = ""
-            try:
-                reply = out_path.read_text(encoding="utf-8", errors="replace").strip()
-            except OSError:
-                reply = ""
-            if not reply:
-                reply = _extract_last_agent_message_from_jsonl(stdout_text)
-            if not reply:
-                raise CodexAdapterError("Codex returned empty reply in JSON mode.")
-            yield {
-                "type": "final",
-                "chat_id": chat_id,
-                "timestamp": time.time(),
-                "reply": reply,
+                reply = _resolve_reply_from_json_mode(
+                    out_path=out_path,
+                    stdout_text=stdout_text,
+                )
+                if not reply:
+                    logger.warning(
+                        "Streaming JSON mode produced empty reply after async run; falling back to plain exec argv=%r",
+                        argv,
+                    )
+                    reply = await self._run_prompt(prompt)
+                    if not reply.strip():
+                        raise CodexAdapterError("Codex returned empty reply in JSON mode.")
+                yield {
+                    "type": "final",
+                    "chat_id": chat_id,
+                    "timestamp": time.time(),
+                    "reply": reply,
                 "usage": usage or {},
                 "timing": {
                     "codex_exec_elapsed_s": self.last_exec_elapsed_s,

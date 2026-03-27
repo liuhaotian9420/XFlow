@@ -23,12 +23,18 @@ class ArtifactPayload(BaseModel):
     """
     Optional non-tabular renderables returned with a result.
 
-    - For PNG: provide `mime="image/png"` and `data_base64` (base64 of raw bytes).
-    - For HTML: provide `mime="text/html"` and `html`.
+    Preferred contract:
+    - provide a lightweight artifact reference via `artifact_id` and/or repo-relative `path`.
+
+    Legacy compatibility:
+    - For PNG: `mime="image/png"` with inline `data_base64` (base64 of raw bytes).
+    - For HTML: `mime="text/html"` with inline `html`.
     """
 
     name: str
     mime: str
+    artifact_id: str | None = None
+    path: str | None = None
     data_base64: str | None = None
     html: str | None = None
     display_width: int | None = None

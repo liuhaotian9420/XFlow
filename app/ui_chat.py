@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -19,6 +20,9 @@ from app.chat_actions import (
     _execute_revise_plan,
 )
 from app.ui_status import result_summary_text, summarize_plan
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ARTIFACT_ALLOWED_ROOTS = {"artifacts", "tmp_files"}
 
 
 def clear_current_chat() -> None:
@@ -129,6 +133,47 @@ def _draw_chart(chart: dict[str, Any]) -> None:
         st.dataframe(chart_df, use_container_width=True)
 
 
+def _collect_charts(result: dict[str, Any]) -> list[dict[str, Any]]:
+    charts: list[dict[str, Any]] = []
+    single = result.get("chart")
+    if isinstance(single, dict):
+        charts.append(single)
+    multi = result.get("charts")
+    if isinstance(multi, list):
+        charts.extend([item for item in multi if isinstance(item, dict)])
+    return charts
+
+
+def _resolve_artifact_path(path_value: Any) -> Path | None:
+    if not isinstance(path_value, str):
+        return None
+    raw = path_value.strip().replace("\\", "/")
+    if not raw:
+        return None
+    candidate = (_REPO_ROOT / raw).resolve()
+    try:
+        rel = candidate.relative_to(_REPO_ROOT)
+    except ValueError:
+        return None
+    rel_s = str(rel).replace("\\", "/")
+    top = rel_s.split("/", 1)[0] if rel_s else ""
+    if top not in _ARTIFACT_ALLOWED_ROOTS:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def _artifact_image_bytes_from_path(artifact: dict[str, Any]) -> bytes | None:
+    path = _resolve_artifact_path(artifact.get("path"))
+    if path is None:
+        return None
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
 def _render_plan_tables(plan: dict[str, Any]) -> None:
     st.markdown(f"**分析目标**: {plan.get('goal', '')}")
     out = plan.get("output") or {}
@@ -151,23 +196,55 @@ def _render_plan_tables(plan: dict[str, Any]) -> None:
 
 
 def _render_result_block(result: dict[str, Any], task_id: str, key_suffix: str) -> None:
-    if "chart" not in result:
+    charts = _collect_charts(result)
+    real_charts: list[dict[str, Any]] = []
+    for chart in charts:
+        is_placeholder_chart = (
+            isinstance(chart, dict)
+            and chart.get("x") == "_"
+            and chart.get("y") == "_"
+            and isinstance(chart.get("data"), list)
+            and len(chart.get("data")) == 0
+        )
+        if not is_placeholder_chart:
+            real_charts.append(chart)
+    table = result.get("table") or {}
+    rows = table.get("rows") or []
+    table_df = pd.DataFrame(rows)
+    artifacts = result.get("artifacts") or []
+    follow = result.get("follow_ups") or []
+    has_summary = bool(
+        str(result.get("summary") or "").strip()
+        or str(result.get("message") or "").strip()
+        or str(result.get("execution_summary") or "").strip()
+    )
+    has_chart = len(real_charts) > 0
+    has_table = not table_df.empty
+    has_artifacts = isinstance(artifacts, list) and len(artifacts) > 0
+    has_follow = isinstance(follow, list) and len(follow) > 0
+
+    if not (has_summary or has_chart or has_table or has_artifacts or has_follow):
         st.warning(result.get("message", "结果中没有可展示的图表。"))
         with st.expander("查看原始结果", key=f"raw_result_{key_suffix}"):
             st.json(result)
         return
-    st.markdown("**结论摘要**")
-    st.write(result_summary_text(result))
+
+    if has_summary:
+        st.markdown("**结论摘要**")
+        st.write(result_summary_text(result))
     if result.get("execution_summary"):
         st.caption(result["execution_summary"])
-    st.markdown("**图表结果**")
-    _draw_chart(result["chart"])
-    table = result.get("table") or {}
-    rows = table.get("rows") or []
-    table_df = pd.DataFrame(rows)
-    st.markdown("**结果明细**")
-    st.dataframe(table_df, use_container_width=True)
-    if not table_df.empty:
+
+    if has_chart:
+        st.markdown("**图表结果**")
+        for idx, chart in enumerate(real_charts):
+            if len(real_charts) > 1:
+                st.caption(f"Chart {idx + 1}")
+            _draw_chart(chart)
+
+    if has_table:
+        st.markdown("**结果明细**")
+        st.dataframe(table_df, use_container_width=True)
         st.download_button(
             "下载结果 CSV",
             data=table_df.to_csv(index=False).encode("utf-8"),
@@ -176,9 +253,8 @@ def _render_result_block(result: dict[str, Any], task_id: str, key_suffix: str) 
             key=f"dl_{key_suffix}",
         )
 
-    artifacts = result.get("artifacts") or []
-    if artifacts:
-        with st.expander("附加产物", key=f"artifacts_{key_suffix}"):
+    if has_artifacts:
+        with st.expander("相关产出", key=f"artifacts_{key_suffix}"):
             for idx, artifact in enumerate(artifacts):
                 name = str(artifact.get("name") or f"artifact_{idx}")
                 mime = str(artifact.get("mime") or "")
@@ -189,6 +265,10 @@ def _render_result_block(result: dict[str, Any], task_id: str, key_suffix: str) 
                 else:
                     width = 640
                 if mime.startswith("image/"):
+                    raw_from_path = _artifact_image_bytes_from_path(artifact)
+                    if raw_from_path is not None:
+                        st.image(raw_from_path, caption=name, width=width)
+                        continue
                     b64 = artifact.get("data_base64")
                     if isinstance(b64, str) and b64.strip():
                         import base64 as _b64
@@ -206,8 +286,8 @@ def _render_result_block(result: dict[str, Any], task_id: str, key_suffix: str) 
                         st.warning(f"HTML artifact `{name}` missing html.")
                 else:
                     st.caption(f"{name} ({mime})")
-    follow = result.get("follow_ups") or []
-    if follow:
+
+    if has_follow:
         st.markdown("**建议下一步**")
         for idx, item in enumerate(follow):
             label = item[:80] + ("..." if len(item) > 80 else "")
@@ -260,6 +340,12 @@ def render_chat_message(i: int, msg: dict[str, Any]) -> None:
             _render_chat_stream_event_panel(msg, i)
         elif mtype == "chat_response":
             st.markdown(msg.get("content", ""))
+            chat_result = msg.get("result")
+            if isinstance(chat_result, dict):
+                task_id = str(msg.get("task_id") or f"chat_result_{i}")
+                with st.container(border=True):
+                    st.markdown("**Result**")
+                    _render_result_block(chat_result, task_id, key_suffix=f"{i}_{task_id[:8]}_chat")
             total_elapsed = None
             for key in ("api_elapsed_s", "codex_exec_elapsed_s", "provider_elapsed_s"):
                 value = msg.get(key)

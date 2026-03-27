@@ -125,7 +125,7 @@ Output JSON must match this shape (field names and types):
     "data_quality_checks": ["string"],
     "metric_sanity_checks": ["string"],
     "coverage_checks": ["string"]
-  ],
+  }},
   "output": {{
     "table_fields": ["string"],
     "chart_type": "line|bar|histogram|table|null",
@@ -155,6 +155,9 @@ def build_summary_prompt(
     result_json = json.dumps(result_summary, ensure_ascii=False, indent=2)
     return f"""You are a data analysis explainer.
 Return plain text summary in Chinese, 2-4 short sentences.
+
+If the result mentions artifacts, describe them briefly at a high level only.
+Do not generate machine-readable result JSON, base64 payloads, binary content, or raw HTML bodies.
 
 Goal:
 {goal}
@@ -201,10 +204,20 @@ row statistics, briefly ask the user to attach CSV/Excel (paperclip) and optiona
 Skill hint: {skill_hint}
 
 Rules:
-- Reply in the same language as the user's latest message when possible (Chinese or English).
-- Be concise (a few short paragraphs or bullets unless the user asks for depth).
-- Do not output raw JSON analysis plans unless the user explicitly asks for a plan skeleton; normal chat should be plain text / markdown.
-- If the user wants to run a structured analysis, mention they can type `/task` followed by their question.
+- Reply in the user’s latest language when possible (Chinese or English).
+- Keep responses concise unless the user asks for depth.
+- Use plain text or markdown in normal chat. Do not output raw JSON plans unless explicitly requested.
+- For structured analysis, mention that the user can type `/task` followed by their question.
+- The final output must always satisfy the chat output schema and include both `reply` and `result`.
+- `result` is only for structured render metadata of existing outputs, not for source code or prose.
+- Only include artifacts that already exist as concrete generated local files/results.
+- Each entry in `result.artifacts` must contain exactly: `name`, `mime`, `path`.
+- `path` must be a controlled repo-relative artifact path, or `null` if no local file exists. Never use absolute paths or invented paths.
+- Use stable MIME types only, such as: `text/html`, `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `text/plain`, `text/csv`, `application/json`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `application/vnd.ms-excel`, `application/octet-stream`.
+- If generating a renderable artifact, save it to a controlled local artifact path before referencing it.
+- Prefer referencing saved local files over inlining content.
+- Never include `data_base64`, raw binary data, or full HTML bodies in chat content or structured metadata.
+- Keep machine-readable fields strictly structured and free of explanatory prose.
 
 {context_block}
 
@@ -233,13 +246,17 @@ CRITICAL output rules:
 - Respond with ONE JSON object only (the full revised plan).
 - No markdown, no code fences, no explanation before or after the JSON.
 - Use only column names that appear in the schema profile below.
-- Preserve the same JSON shape as the current plan, including completeness assessment fields.
+- Preserve the same skill-native JSON shape as the current plan.
 - Apply the user's instruction faithfully; adjust metrics, dimensions, filters, chart type, or goal text as needed.
 - "aggregation" must be one of: sum, mean, count, max, min, median.
 - "operator" must be one of: eq, neq, gt, gte, lt, lte, in, not_in, contains.
-- "role" must be one of: time, category, geo.
-- "chart_type" must be one of: line, bar, histogram.
-- Update "ambiguities", "confidence", and "completeness" to reflect any remaining uncertainty after the revision.
+- "role" must be one of: time, category, geo (or null when uncertain).
+- "output.chart_type" may be: line, bar, histogram, table, or null.
+- "completion_state" must be one of: needs_clarification, minimally_completed, reviewed.
+- Update "ambiguities", "confidence", and "completion_state" to reflect any remaining uncertainty after the revision.
+- "metrics" must contain at least one item.
+- "methods" must contain at least one item.
+- "output.table_fields" must contain at least one item.
 
 Current plan:
 {plan_json}
@@ -266,7 +283,9 @@ Generate exactly 3 short follow-up questions in Chinese.
 Output rules:
 - Return ONE JSON array of 3 strings only.
 - No markdown, no code fences, no other text.
-Example: ["鏄惁闇€瑕佹寜鏈堜唤缁х画涓嬮捇锛?, "鏄惁瑕佸姣斿叾浠栧尯鍩燂紵", "鏄惁闇€瑕佸鍑烘槑缁嗭紵"]
+- Keep the questions user-facing and concise.
+- Do not include raw JSON objects, base64 payloads, or HTML in the questions.
+Example: ["接下来要按时间趋势继续看吗？", "要不要按渠道或区域做对比？", "要不要下钻查看明细样本？"]
 
 Goal:
 {goal}

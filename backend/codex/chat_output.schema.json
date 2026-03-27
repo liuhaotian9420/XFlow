@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "properties": {
+    "reply": {
+      "type": "string"
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "mime": { "type": "string" },
+              "path": { "type": ["string", "null"] }
+            },
+            "required": ["name", "mime", "path"]
+          }
+        },
+        "follow_ups": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": ["artifacts", "follow_ups"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["reply", "result"],
+  "additionalProperties": false
+}

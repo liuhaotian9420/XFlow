@@ -137,6 +137,41 @@ def _sse_json(event: dict[str, object]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+def _reply_debug_summary(reply: str) -> str:
+    text = (reply or "").strip()
+    if not text:
+        return "reply=empty"
+    if not (text.startswith("{") and text.endswith("}")):
+        return f"reply=plain chars={len(text)}"
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return f"reply=json_like_but_invalid chars={len(text)}"
+    if not isinstance(obj, dict):
+        return f"reply=json_non_object type={type(obj).__name__}"
+    result = obj.get("result")
+    if not isinstance(result, dict):
+        return "reply=json_object result=none"
+    artifacts = result.get("artifacts")
+    artifacts_n = len(artifacts) if isinstance(artifacts, list) else 0
+    html_n = 0
+    path_n = 0
+    if isinstance(artifacts, list):
+        for a in artifacts:
+            if not isinstance(a, dict):
+                continue
+            mime = str(a.get("mime") or "").strip().lower()
+            if mime == "text/html":
+                html_n += 1
+            if isinstance(a.get("path"), str) and a.get("path", "").strip():
+                path_n += 1
+    return (
+        "reply=json_object "
+        f"result_keys={sorted(result.keys())} artifacts={artifacts_n} "
+        f"html_artifacts={html_n} artifacts_with_path={path_n}"
+    )
+
+
 def _save_chat_turn_record(
     *,
     turn_id: str,
@@ -522,6 +557,12 @@ async def chat_message_stream(
                     "runtime_vendor": runtime_vendor,
                     "runtime_binary": runtime_binary,
                 }
+                logger.info(
+                    "[CHATDBG][backend][stream_final][mock] chat_id=%s turn_id=%s %s",
+                    chat_id,
+                    turn_id,
+                    _reply_debug_summary(reply),
+                )
                 final_reply = reply
                 final_emitted = True
                 yield _sse_json(final_event)
@@ -562,6 +603,12 @@ async def chat_message_stream(
                         event["timing"]["provider_elapsed_s"] = provider_elapsed_s
                         event["timing"]["provider_overhead_elapsed_s"] = provider_overhead_elapsed_s
                         event["timing"]["api_elapsed_s"] = time.perf_counter() - t0
+                    logger.info(
+                        "[CHATDBG][backend][stream_final] chat_id=%s turn_id=%s %s",
+                        chat_id,
+                        turn_id,
+                        _reply_debug_summary(str(event.get("reply") or "")),
+                    )
                     final_emitted = True
                 yield _sse_json(event)
 
@@ -617,6 +664,12 @@ async def chat_message_stream(
                         "api_elapsed_s": time.perf_counter() - t0,
                     },
                 }
+                logger.info(
+                    "[CHATDBG][backend][stream_final][fallback] chat_id=%s turn_id=%s %s",
+                    chat_id,
+                    turn_id,
+                    _reply_debug_summary(reply),
+                )
                 final_emitted = True
                 yield _sse_json(fallback_event)
                 return

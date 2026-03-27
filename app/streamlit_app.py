@@ -25,7 +25,7 @@ from app.ui_sidebar import render_sidebar
 from app.ui_status import inject_global_styles, render_status_panel
 
 st.set_page_config(
-    page_title="Private Data Analysis Assistant",
+    page_title="私有数据分析助手",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon=":bar_chart:",
@@ -33,18 +33,18 @@ st.set_page_config(
 st.markdown(
     """
     <h1 class="xyf-page-title">
-        Private Data Analysis Assistant
+        私有数据分析助手
     </h1>
     """,
     unsafe_allow_html=True,
 )
-st.caption("Workspace for lightweight analysis chat, task planning, execution review, skills, and reusable artifacts.")
+st.caption("面向数据分析场景的轻量工作台，支持对话分析、任务规划、执行确认、技能调用与结果沉淀。")
 inject_global_styles()
 
 _init_state()
 render_sidebar()
 
-tab_chat, tab_skills, tab_artifacts = st.tabs(["Chat", "Skills", "Artifacts"])
+tab_chat, tab_skills, tab_artifacts = st.tabs(["对话分析", "技能", "产物"])
 
 with tab_chat:
     if st.session_state.get("_followup_q"):
@@ -69,16 +69,16 @@ with tab_chat:
     _ensure_welcome_if_empty()
     cur_status, reset_status = st.columns([10, 1])
     with cur_status:
-        with st.expander("Current conversation status", expanded=False):
+        with st.expander("当前会话状态", expanded=False):
             render_status_panel()
             st.markdown("")
     with reset_status:
         if st.button(
-            "Reset",
+            "重置",
             key="reset_chat",
             use_container_width=True,
             type="primary",
-            help="Reset this conversation. History remains available in the sidebar.",
+            help="重置当前会话，历史记录仍可在侧边栏中查看。",
         ):
             clear_current_chat()
             st.rerun()
@@ -94,7 +94,7 @@ with tab_chat:
 
     if exp_lo < exp_hi:
         hidden_count = exp_hi - exp_lo
-        with st.expander(f"Load earlier messages ({hidden_count})", key="viewport_older_messages"):
+        with st.expander(f"加载更早消息（{hidden_count} 条）", key="viewport_older_messages"):
             for idx in range(exp_lo, exp_hi):
                 render_chat_message(idx, messages[idx])
 
@@ -102,7 +102,7 @@ with tab_chat:
         render_chat_message(idx, messages[idx])
 
     chat_val = st.chat_input(
-        "Ask a question, or type /task + an analysis request. You can also attach a CSV or Excel file.",
+        "直接提问，或输入 /task + 分析需求。也可以附带 CSV 或 Excel 文件。",
         accept_file=True,
         file_type=["csv", "xlsx", "xls"],
         key="chat_prompt",
@@ -121,7 +121,7 @@ with tab_chat:
             if prev_name != f0.name:
                 _invalidate_schema_cache()
             st.session_state.messages.append(
-                {"role": "assistant", "type": "text", "content": f"Loaded file **`{f0.name}`**."}
+                {"role": "assistant", "type": "text", "content": f"已加载文件 **`{f0.name}`**。"}
             )
         if text:
             st.session_state.messages.append({"role": "user", "type": "text", "content": text})
@@ -132,7 +132,7 @@ with tab_chat:
                         {
                             "role": "assistant",
                             "type": "text",
-                            "content": "Add an analysis request after **`/task`**, for example `/task compare sales by region`.",
+                            "content": "请在 **`/task`** 后补充分析需求，例如 `/task 比较各区域销售额`。",
                         }
                     )
                 else:
@@ -150,7 +150,7 @@ with tab_chat:
                 _enqueue_chat(text)
         elif file_list and not text:
             st.session_state.messages.append(
-                {"role": "assistant", "type": "text", "content": "File attached. Ask a question when ready."}
+                {"role": "assistant", "type": "text", "content": "文件已附加，可以开始提问了。"}
             )
         st.rerun()
 

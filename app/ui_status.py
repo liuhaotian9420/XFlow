@@ -198,35 +198,35 @@ def inject_global_styles() -> None:
 def _task_status_label() -> str:
     active_task_id = str(st.session_state.get("active_task_id") or "").strip()
     if not active_task_id:
-        return "Idle"
+        return "空闲"
     for msg in reversed(st.session_state.messages):
         if str(msg.get("task_id") or "").strip() != active_task_id:
             continue
         mtype = str(msg.get("type") or "").strip()
         if mtype == "thinking" and msg.get("action") == "confirm_task":
-            return "Running"
+            return "执行中"
         if mtype in ("task_done_confirm", "result"):
-            return "Done"
+            return "已完成"
         if mtype == "review_request" and not bool(msg.get("resolved")):
-            return "Waiting for input"
+            return "等待补充信息"
         if mtype == "plan_review":
-            return "Waiting for confirmation"
-    return "In progress"
+            return "等待确认"
+    return "处理中"
 
 
 def render_status_panel() -> None:
     file_meta = st.session_state.get("file_meta") or {}
-    file_name = str(file_meta.get("name") or "No file uploaded")
-    mode_label = "Task" if st.session_state.get("mode") == "task" else "Chat"
+    file_name = str(file_meta.get("name") or "尚未上传文件")
+    mode_label = "任务模式" if st.session_state.get("mode") == "task" else "对话模式"
     session_id = str(st.session_state.get("chat_session_id") or "")[:8]
     task_status = _task_status_label()
     active_task = str(st.session_state.get("active_task_id") or "").strip()
 
     cols = st.columns(3)
     items = [
-        ("Current mode", mode_label, f"session `{session_id}...`" if session_id else "session not initialized"),
-        ("Current file", file_name, "Supports CSV / Excel"),
-        ("Task status", task_status, f"task `{active_task[:8]}...`" if active_task else "No active task"),
+        ("当前模式", mode_label, f"会话 `{session_id}...`" if session_id else "会话尚未初始化"),
+        ("当前文件", file_name, "支持 CSV / Excel"),
+        ("任务状态", task_status, f"任务 `{active_task[:8]}...`" if active_task else "当前没有活动任务"),
     ]
     for col, (label, value, sub) in zip(cols, items):
         with col:
@@ -257,12 +257,12 @@ def summarize_plan(plan: dict[str, Any]) -> str:
         for item in dims[:2]
         if isinstance(item, dict)
     ]
-    metric_text = ", ".join([x for x in metric_names if x]) or "key metrics"
-    dim_text = ", ".join([x for x in dim_names if x]) or "main dimensions"
-    chart_text = str(out.get("chart_type") or "chart").strip() or "chart"
+    metric_text = "、".join([x for x in metric_names if x]) or "关键指标"
+    dim_text = "、".join([x for x in dim_names if x]) or "主要维度"
+    chart_text = str(out.get("chart_type") or "图表").strip() or "图表"
     if goal:
-        return f"The plan analyzes '{goal}' using {metric_text}, broken down by {dim_text}, and outputs a {chart_text}."
-    return f"The plan analyzes {metric_text}, broken down by {dim_text}, and outputs a {chart_text}."
+        return f"该计划将围绕“{goal}”展开分析，重点关注 {metric_text}，按 {dim_text} 进行拆解，并输出 {chart_text}。"
+    return f"该计划将分析 {metric_text}，按 {dim_text} 进行拆解，并输出 {chart_text}。"
 
 
 def result_summary_text(result: dict[str, Any]) -> str:
@@ -275,5 +275,5 @@ def result_summary_text(result: dict[str, Any]) -> str:
     table = result.get("table") or {}
     rows = table.get("rows") or []
     if rows:
-        return f"Analysis finished with {len(rows)} rows."
-    return "Analysis finished."
+        return f"分析已完成，共返回 {len(rows)} 行结果。"
+    return "分析已完成。"
