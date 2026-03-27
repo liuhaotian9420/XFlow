@@ -22,6 +22,7 @@ from backend.chat_store import (
 from backend.codex.errors import CodexAdapterError
 from backend.codex.factory import get_provider
 from backend.codex.mock import MockProvider
+from backend.mock_scenarios import next_stream_events
 from backend.codex.xinfei_sso import is_xinfei_enterprise_binary, resolve_codex_executable
 from backend.observability import log_event
 from backend.runtime_config import default_use_mock
@@ -532,17 +533,36 @@ async def chat_message_stream(
         try:
             p0 = time.perf_counter()
             if isinstance(adapter, MockProvider):
-                reply = await adapter.chat(
-                    message=text,
-                    history=history,
-                    file_context=payload.file_context,
-                    task_id=chat_id,
-                )
+                scripted_events = next_stream_events(session_id)
                 provider_elapsed_s = time.perf_counter() - p0
                 runtime_vendor, runtime_binary = _chat_runtime_fields(
                     adapter=adapter,
                     is_fallback=False,
                     use_mock_flag=use_mock_flag,
+                )
+                if scripted_events:
+                    for raw_event in scripted_events:
+                        event = dict(raw_event)
+                        event["chat_id"] = chat_id
+                        event["session_id"] = session_id
+                        event["turn_id"] = turn_id
+                        if str(event.get("type") or "").strip().lower() == "final":
+                            final_reply = str(event.get("reply") or "").strip() or None
+                            final_emitted = True
+                            event["runtime_vendor"] = runtime_vendor
+                            event["runtime_binary"] = runtime_binary
+                            event.setdefault("timing", {})
+                            if isinstance(event["timing"], dict):
+                                event["timing"]["provider_elapsed_s"] = provider_elapsed_s
+                                event["timing"]["api_elapsed_s"] = time.perf_counter() - t0
+                        yield _sse_json(event)
+                    if final_emitted:
+                        return
+                reply = await adapter.chat(
+                    message=text,
+                    history=history,
+                    file_context=payload.file_context,
+                    task_id=session_id,
                 )
                 final_event = {
                     "type": "final",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from backend.mock_scenarios import next_chat_reply
 from backend.planning.adapters import parse_plan_payload
 from backend.schemas.plan import (
     Aggregation,
@@ -133,6 +134,9 @@ class MockProvider:
         file_context: dict | None,
         task_id: str = "mock",
     ) -> str:
+        scripted = next_chat_reply(task_id)
+        if scripted:
+            return scripted
         if file_context:
             filename = file_context.get("filename", "unknown")
             rows = file_context.get("row_count", "?")

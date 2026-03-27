@@ -1,0 +1,30 @@
+# by_table
+
+| 表名 | 来源文件数 | 详情 |
+| --- | --- | --- |
+| xyf_ads.ads_fin_onloan_fee_df | 1 | [详情](./xyf_ads.ads_fin_onloan_fee_df.md) |
+| xyf_ads.ads_inloan_loan_balance_mthly_df_01 | 1 | [详情](./xyf_ads.ads_inloan_loan_balance_mthly_df_01.md) |
+| xyf_ads.ads_inloan_loan_monitor_screen_df | 1 | [详情](./xyf_ads.ads_inloan_loan_monitor_screen_df.md) |
+| xyf_ads.ads_user_market_portfolio_label_df | 1 | [详情](./xyf_ads.ads_user_market_portfolio_label_df.md) |
+| xyf_bi_dev.amt_predict_oct24_v2 | 1 | [详情](./xyf_bi_dev.amt_predict_oct24_v2.md) |
+| xyf_dim.dim_pub_date | 10 | [详情](./xyf_dim.dim_pub_date.md) |
+| xyf_dwd.dwd_inloan_leap_vip_order_hf | 5 | [详情](./xyf_dwd.dwd_inloan_leap_vip_order_hf.md) |
+| xyf_dwd.dwd_inloan_loan_apply_main_df | 2 | [详情](./xyf_dwd.dwd_inloan_loan_apply_main_df.md) |
+| xyf_dwd.dwd_preloan_credit_apply_df | 6 | [详情](./xyf_dwd.dwd_preloan_credit_apply_df.md) |
+| xyf_dwd.dwd_repay_loan_repay_plan_df | 3 | [详情](./xyf_dwd.dwd_repay_loan_repay_plan_df.md) |
+| xyf_dwd.dwd_risk_model_b_card_df | 1 | [详情](./xyf_dwd.dwd_risk_model_b_card_df.md) |
+| xyf_dwd.dwd_user_tek_order_df | 3 | [详情](./xyf_dwd.dwd_user_tek_order_df.md) |
+| xyf_dwd.dwd_user_vip_order_df | 5 | [详情](./xyf_dwd.dwd_user_vip_order_df.md) |
+| xyf_dws.dws_inloan_loan_channel_stat_df | 1 | [详情](./xyf_dws.dws_inloan_loan_channel_stat_df.md) |
+| xyf_dws.dws_inloan_loan_channel_stat_df_04 | 1 | [详情](./xyf_dws.dws_inloan_loan_channel_stat_df_04.md) |
+| xyf_dws.dws_inloan_loan_pass_stat_df | 1 | [详情](./xyf_dws.dws_inloan_loan_pass_stat_df.md) |
+| xyf_dws.dws_inloan_loan_risk_stat_df | 1 | [详情](./xyf_dws.dws_inloan_loan_risk_stat_df.md) |
+| xyf_dws.dws_inloan_user_order_df | 12 | [详情](./xyf_dws.dws_inloan_user_order_df.md) |
+| xyf_dws.dws_inloan_user_order_hf_v | 1 | [详情](./xyf_dws.dws_inloan_user_order_hf_v.md) |
+| xyf_dws.dws_repay_risk_order_bill_mob_df | 3 | [详情](./xyf_dws.dws_repay_risk_order_bill_mob_df.md) |
+| xyf_dws.dws_repay_user_order_df | 2 | [详情](./xyf_dws.dws_repay_user_order_df.md) |
+| xyf_fengkong_dev.hhn_fk_ord_flg_all | 1 | [详情](./xyf_fengkong_dev.hhn_fk_ord_flg_all.md) |
+| xyf_fengkong_dev.scq_fy_history_risk_price_modify | 1 | [详情](./xyf_fengkong_dev.scq_fy_history_risk_price_modify.md) |
+| xyf_fengkong_dev.wzq_order_b5_b4_compare_base | 1 | [详情](./xyf_fengkong_dev.wzq_order_b5_b4_compare_base.md) |
+| xyf_fengkong_dev.zsh_tek_fk_ord_flg | 1 | [详情](./xyf_fengkong_dev.zsh_tek_fk_ord_flg.md) |
+| xyf_fengkong_dev.zsh_vip_fk_ord_flg | 1 | [详情](./xyf_fengkong_dev.zsh_vip_fk_ord_flg.md) |

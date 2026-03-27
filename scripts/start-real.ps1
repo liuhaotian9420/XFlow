@@ -1,7 +1,7 @@
 param(
     [string]$ApiBaseUrl = "http://127.0.0.1:8000",
     [int]$FrontendPort = 8501,
-    [switch]$NoReload,
+    [switch]$Reload,
     [switch]$SkipSync
 )
 
@@ -70,7 +70,7 @@ uv run streamlit run app/streamlit_app.py --server.port $FrontendPort
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$reload = -not $NoReload.IsPresent
+$reload = $Reload.IsPresent
 $apiEndpoint = Resolve-ApiEndpoint -ApiBaseUrl $ApiBaseUrl
 $shellCommand = Get-LauncherShellCommand
 
@@ -80,6 +80,7 @@ Write-Host "mode: real"
 Write-Host "api base url: $ApiBaseUrl"
 Write-Host "launcher shell: $shellCommand"
 Write-Host "frontend port: $FrontendPort"
+Write-Host "backend reload: $reload"
 
 Set-Location $projectRoot
 Invoke-RequiredToolCheck

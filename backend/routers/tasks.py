@@ -23,6 +23,16 @@ from backend.codex.errors import CodexAdapterError
 from backend.codex.factory import get_provider
 from backend.codex.mock import MockProvider
 from backend.execution.engine import run_plan
+from backend.mock_scenarios import (
+    next_task_create_payload,
+    next_task_revise_payload,
+    next_task_review_payload,
+    next_task_run_payload,
+    parse_plan_payload as parse_scenario_plan_payload,
+    parse_result_payload,
+    parse_review_payload,
+    parse_status,
+)
 from backend.execution.skill_result_adapter import enrich_result_with_skill_outputs
 from backend.observability import ARTIFACT_DIR, ROOT_DIR, diff_dicts, log_event, save_snapshot
 from backend.profiler.schema_profiler import profile_upload
@@ -367,6 +377,19 @@ async def _run_task_with_plan(
     _update_status(record, TaskStatus.RUNNING)
     _persist_task(record)
     try:
+        if _effective_use_mock(use_mock):
+            scripted = next_task_run_payload(task_id)
+            if scripted is not None:
+                scripted_result = parse_result_payload(scripted.get("result"))
+                if scripted_result is not None:
+                    record.result = scripted_result
+                    record.error = None
+                    _update_status(record, parse_status(scripted.get("status"), TaskStatus.COMPLETED))
+                    _persist_task(record)
+                    save_snapshot(task_id, "final_plan", plan.model_dump())
+                    save_snapshot(task_id, "result", record.result.model_dump(mode="json"))
+                    log_event(task_id, "run", "task_completed_scripted_mock", {"status": record.status.value})
+                    return record
         df = TASK_DATAFRAMES.get(task_id)
         if df is None:
             raise HTTPException(
@@ -571,6 +594,9 @@ async def create_task(
     df, schema_profile = profile_upload(file)
     explicit = use_mock
     use_mock_flag = _effective_use_mock(explicit)
+    scripted_create = next_task_create_payload(task_id) if use_mock_flag else None
+    scripted_plan = parse_scenario_plan_payload((scripted_create or {}).get("plan"))
+    scripted_review = parse_review_payload((scripted_create or {}).get("pending_review"))
     effective_timeout_seconds = resolve_timeout_seconds(
         auto_timeout=auto_timeout,
         explicit_timeout_seconds=timeout_seconds,
@@ -586,11 +612,16 @@ async def create_task(
         timeout_seconds=effective_timeout_seconds,
     )
     try:
-        plan = await adapter.generate_plan(
-            question=question, schema_profile=schema_profile, task_id=task_id
-        )
-        raw_skill_plan = _extract_raw_skill_plan(adapter, plan)
-        log_event(task_id, "plan", "plan_generated", {"use_mock": use_mock_flag})
+        if scripted_plan is not None:
+            plan = scripted_plan
+            raw_skill_plan = None
+            log_event(task_id, "plan", "plan_generated_scripted_mock", {"use_mock": use_mock_flag})
+        else:
+            plan = await adapter.generate_plan(
+                question=question, schema_profile=schema_profile, task_id=task_id
+            )
+            raw_skill_plan = _extract_raw_skill_plan(adapter, plan)
+            log_event(task_id, "plan", "plan_generated", {"use_mock": use_mock_flag})
     except (CodexAdapterError, Exception) as exc:
         _record_codex_failure(task_id, str(exc))
         if not use_mock_flag:
@@ -629,8 +660,10 @@ async def create_task(
             column_count=schema_profile["column_count"],
         ),
         plan=plan,
+        pending_review=scripted_review,
     )
-    _maybe_attach_completeness_review(record, reason="create_task")
+    if scripted_review is None:
+        _maybe_attach_completeness_review(record, reason="create_task")
     TASKS[task_id] = record
     TASK_DATAFRAMES[task_id] = df
     TASK_SNAPSHOTS[task_id] = {"schema_profile": schema_profile}
@@ -725,16 +758,23 @@ async def revise_plan(
         reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
         timeout_seconds=effective_timeout_seconds,
     )
+    scripted = next_task_revise_payload(task_id) if use_mock_flag else None
+    scripted_plan = parse_scenario_plan_payload((scripted or {}).get("plan"))
 
     try:
-        new_plan = await adapter.revise_plan(
-            current_plan=record.plan,
-            instruction=instruction,
-            schema_profile=schema_profile,
-            task_id=task_id,
-        )
-        raw_skill_plan = _extract_raw_skill_plan(adapter, new_plan)
-        log_event(task_id, "plan", "plan_revised", {"use_mock": use_mock_flag})
+        if scripted_plan is not None:
+            new_plan = scripted_plan
+            raw_skill_plan = None
+            log_event(task_id, "plan", "plan_revised_scripted_mock", {"use_mock": use_mock_flag})
+        else:
+            new_plan = await adapter.revise_plan(
+                current_plan=record.plan,
+                instruction=instruction,
+                schema_profile=schema_profile,
+                task_id=task_id,
+            )
+            raw_skill_plan = _extract_raw_skill_plan(adapter, new_plan)
+            log_event(task_id, "plan", "plan_revised", {"use_mock": use_mock_flag})
     except (CodexAdapterError, Exception) as exc:
         _record_codex_failure(task_id, str(exc))
         if not use_mock_flag:
@@ -947,6 +987,9 @@ async def respond_review(
     explicit = use_mock if use_mock is not None else payload.use_mock
     user_text = (payload.user_text or "").strip()
     choice = (payload.choice or "").strip()
+    scripted = next_task_review_payload(task_id) if _effective_use_mock(explicit) else None
+    scripted_plan = parse_scenario_plan_payload((scripted or {}).get("plan"))
+    scripted_review = parse_review_payload((scripted or {}).get("pending_review"))
 
     # User free text is always higher priority than button/options.
     if user_text:
@@ -955,23 +998,26 @@ async def respond_review(
         review.resolved_at = datetime.now(timezone.utc)
         record.review_history.append(review)
         record.pending_review = None
-        await _revise_record_plan_with_instruction(
-            task_id=task_id,
-            record=record,
-            instruction=user_text,
-            use_mock=explicit,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            think_level=think_level,
-            timeout_seconds=resolve_timeout_seconds(
-                auto_timeout=auto_timeout,
-                explicit_timeout_seconds=timeout_seconds,
-                route_kind="task_revise",
+        if scripted_plan is not None:
+            record.plan = scripted_plan
+        else:
+            await _revise_record_plan_with_instruction(
+                task_id=task_id,
+                record=record,
+                instruction=user_text,
+                use_mock=explicit,
                 model=model,
-                reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
-                env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
-            ),
-        )
+                reasoning_effort=reasoning_effort,
+                think_level=think_level,
+                timeout_seconds=resolve_timeout_seconds(
+                    auto_timeout=auto_timeout,
+                    explicit_timeout_seconds=timeout_seconds,
+                    route_kind="task_revise",
+                    model=model,
+                    reasoning_effort=_effective_reasoning_effort(reasoning_effort, think_level),
+                    env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+                ),
+            )
         log_event(
             task_id,
             "review",
@@ -998,7 +1044,7 @@ async def respond_review(
             save_snapshot(task_id, "plan", record.plan.model_dump())
             log_event(task_id, "review", "review_suggestion_applied", {"review_id": review.review_id})
     record.review_history.append(review)
-    record.pending_review = None
+    record.pending_review = scripted_review
     _persist_task(record)
     log_event(
         task_id,

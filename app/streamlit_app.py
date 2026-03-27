@@ -25,7 +25,7 @@ from app.ui_sidebar import render_sidebar
 from app.ui_status import inject_global_styles, render_status_panel
 
 st.set_page_config(
-    page_title="私有数据分析助手",
+    page_title="XFlow",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon=":bar_chart:",
@@ -33,7 +33,7 @@ st.set_page_config(
 st.markdown(
     """
     <h1 class="xyf-page-title">
-        私有数据分析助手
+        XFlow: 你的一站式 AI 数据分析工作台
     </h1>
     """,
     unsafe_allow_html=True,
@@ -44,7 +44,7 @@ inject_global_styles()
 _init_state()
 render_sidebar()
 
-tab_chat, tab_skills, tab_artifacts = st.tabs(["对话分析", "技能", "产物"])
+tab_chat, tab_skills, tab_artifacts, bussiness_theme, topics = st.tabs(["📊AI助手", "📰技能库", "📚分析产出",'💎业务知识库','🏉专题追踪'])
 
 with tab_chat:
     if st.session_state.get("_followup_q"):

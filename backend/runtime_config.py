@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,12 +29,17 @@ ODPS_ENV_KEYS = {
     "project": ("ODPS_PROJECT", "ALIBABA_CLOUD_PROJECT_JINGYING"),
     "endpoint": ("ODPS_ENDPOINT", "ALIBABA_CLOUD_REGION_ENDPOINT"),
 }
+RUNTIME_STATUS_TTL_SECONDS = max(1, int(os.getenv("RUNTIME_STATUS_TTL_SECONDS", "10")))
 
 
 @dataclass(frozen=True)
 class ReadinessIssue:
     code: str
     message: str
+
+
+_runtime_status_cache: dict[str, object] | None = None
+_runtime_status_cache_expires_at: float = 0.0
 
 
 def get_app_mode() -> str:
@@ -99,12 +105,18 @@ def _odps_issues() -> list[ReadinessIssue]:
 
 
 def get_runtime_status() -> dict[str, object]:
+    global _runtime_status_cache, _runtime_status_cache_expires_at
+
+    now = time.time()
+    if _runtime_status_cache is not None and now < _runtime_status_cache_expires_at:
+        return dict(_runtime_status_cache)
+
     mode = get_app_mode()
     codex_command = resolve_codex_executable()
     codex_issues = _codex_issues()
     odps_issues = _odps_issues()
     odps_env = resolve_odps_env()
-    return {
+    status = {
         "app_mode": mode,
         "default_use_mock": default_use_mock(),
         "codex": {
@@ -120,6 +132,9 @@ def get_runtime_status() -> dict[str, object]:
             "issues": [issue.__dict__ for issue in odps_issues],
         },
     }
+    _runtime_status_cache = status
+    _runtime_status_cache_expires_at = now + RUNTIME_STATUS_TTL_SECONDS
+    return dict(status)
 
 
 def require_runtime_ready(*, needs_codex: bool = False, needs_odps: bool = False) -> None:

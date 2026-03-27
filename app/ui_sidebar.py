@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 
@@ -27,10 +28,18 @@ from app.streamlit_state import (
 
 
 def _load_runtime_status() -> dict[str, Any] | None:
+    cached = st.session_state.get("_runtime_status_cache")
+    expires_at = float(st.session_state.get("_runtime_status_cache_expires_at") or 0.0)
+    now = time.time()
+    if isinstance(cached, dict) and now < expires_at:
+        return cached
     try:
         resp = requests.get(_api_url("/runtime/status"), timeout=5)
         resp.raise_for_status()
-        return resp.json()
+        payload = resp.json()
+        st.session_state["_runtime_status_cache"] = payload
+        st.session_state["_runtime_status_cache_expires_at"] = now + 10.0
+        return payload
     except Exception:
         return None
 
@@ -126,7 +135,7 @@ def _render_system_section(runtime_status: dict[str, Any] | None) -> None:
     st.markdown(
         (
             '<div class="xyf-sidebar-system-row">'
-            '<div class="xyf-sidebar-system-title">系统状态</div>'
+            f'<div class="xyf-sidebar-system-title">系统状态{"🟢" if len(issues) == 0 else "🟡" if len(issues) < 2 else "🔴"}</div>'
             f'<div class="xyf-sidebar-system-copy">{summary}</div>'
             "</div>"
         ),
@@ -141,7 +150,7 @@ def _render_system_section(runtime_status: dict[str, Any] | None) -> None:
         st.toggle("启用 MOCK（本地模拟）", value=False, key="use_codex_mock")
         st.toggle("显示提示词调试信息", value=False, key="show_prompt_debug")
         st.toggle("显示对话事件流", value=True, key="show_chat_event_stream")
-        st.toggle("智能超时", value=True, key="smart_timeout_enabled")
+        st.toggle("智能控时", value=True, key="smart_timeout_enabled")
         if not bool(st.session_state.get("smart_timeout_enabled", True)):
             st.text_input(
                 "超时时间（秒）",
@@ -168,7 +177,7 @@ def _render_recent_task_card(item: dict[str, Any]) -> None:
     title = _task_card_title(item.get("question"))
     meta = _task_card_meta(item, task_id)
 
-    st.markdown('<div class="xyf-task-card">', unsafe_allow_html=True)
+    # st.markdown('<div class="xyf-task-card">', unsafe_allow_html=True)
     st.markdown(f'<div class="xyf-task-title">{title}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="xyf-task-meta">{meta}</div>', unsafe_allow_html=True)
 
@@ -214,7 +223,7 @@ def _render_recent_task_card(item: dict[str, Any]) -> None:
 def render_sidebar() -> None:
     runtime_status = _load_runtime_status()
     with st.sidebar:
-        _render_workspace_summary()
+        # _render_workspace_summary()
         _render_system_section(runtime_status)
 
         with st.expander("会话历史", expanded=False):

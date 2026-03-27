@@ -1,6 +1,6 @@
 ---
 name: sql-export-agent
-description: Execute a single ODPS SQL file, export the result to Excel, and optionally persist it to DuckDB with lifecycle cleanup.
+description: Execute a single ODPS SQL file, export the result to Excel, optionally persist it to DuckDB, and maintain DataWorks table metadata notes. Use when Codex needs to run an existing `.sql` file in MaxCompute / ODPS, export query results, cache them locally, extract table usage from SQL snippets, or when a known ODPS table name needs its field names, data types, DDL, and sample rows synced into `references/tables.md`.
 ---
 
 ## Watermark
@@ -12,166 +12,161 @@ description: Execute a single ODPS SQL file, export the result to Excel, and opt
   - `version`: watermark version, default `v1`
   - `input_files`: input file names/paths used for this run, or `[]`
   - `actions`: concise completed actions for this run
-- Include the executed SQL file in `input_files` when available.
+- Include the executed SQL file, synced table name, or fixture path in `input_files` when available.
 - Do this before the final answer for the skill, and overwrite rather than append.
 
 # SQL Export Agent
 
 ## Purpose
 
-Turn one `.sql` file into a controlled execution workflow that an agent can run safely and repeatedly:
+Own a narrow, repeatable DataWorks workflow:
 
-1. read SQL from disk
-2. execute it in ODPS
-3. materialize the result as a pandas DataFrame
-4. export to `.xlsx`
-5. optionally cache the same result into DuckDB
-6. enforce local DuckDB table lifecycle cleanup
+1. execute one existing ODPS SQL file
+2. export the result to Excel
+3. optionally cache the same result into DuckDB
+4. extract table usage from local SQL snippets
+5. sync known ODPS table metadata into [references/tables.md](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/references/tables.md)
+6. bootstrap `references/tables.md` from an existing ground-truth markdown file
 
-This skill is for **single-file SQL execution and export**, not for arbitrary multi-step SQL orchestration.
+Do not treat this skill as a generic SQL authoring or multi-job orchestration skill.
+
+## Dependency boundary
+
+- Python runtime with `pyodps`
+- `pandas`
+- `python-dotenv`
+- `duckdb` for local cache mode
+- Live ODPS credentials only when calling ODPS directly
+- No live credentials are required for the mock metadata sync path
 
 ## Directory index
 
 ```text
 .
-├── SKILL.md
-├── references/  
-│   └── duckdb.md
-└── scripts/
-    ├── run_sql_export.py
-    ├── example.env
-    └── example_command.sh
+├─ SKILL.md
+├─ references/
+│  ├─ duckdb.md
+│  ├─ pythonodps.md
+│  ├─ table-metadata.md
+│  ├─ tables.md
+│  └─ prompts/
+│     └─ table_extraction.md
+├─ scripts/
+│  ├─ example.env
+│  ├─ example.sql
+│  ├─ example_command.sh
+│  ├─ extract_tables_from_sql_snippets.py
+│  ├─ bootstrap_tables_reference.py
+│  ├─ run_sql_export.py
+│  └─ sync_table_metadata.py
+└─ tests/
+   ├─ fixtures/
+   │  └─ mock_table_metadata.json
+   └─ smoke_sync_table_metadata.py
 ```
 
 ## Read these first
 
-- `references/tables.md`: expected source/target table notes, naming assumptions, business table context
-- `references/duckdb.md`: local cache behavior, DuckDB usage rules, lifecycle metadata conventions
-- `references/pythonodps.md`: PyODPS installation, ODPS client construction, SQL execution, result retrieval, and DataWorks Tunnel caveats
-
-## What this skill does
-
-Given a SQL file path, the workflow:
-
-- loads environment variables with `dotenv`
-- creates an ODPS client from CLI args or env vars
-- reads the SQL text from file
-- submits the SQL asynchronously with `odps.run_sql(...)`
-- prints the Logview URL immediately
-- waits for task success
-- opens an Arrow reader with tunnel mode
-- converts the full result to pandas with multiprocessing
-- stops if the DataFrame is empty
-- writes Excel output under `save_path`
-- optionally writes the same data into a DuckDB table
-- before DuckDB write, drops expired cached tables recorded in lifecycle metadata
+- [references/pythonodps.md](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/references/pythonodps.md): ODPS client construction, SQL execution, result retrieval
+- [references/table-metadata.md](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/references/table-metadata.md): official PyODPS APIs for schema, DDL, and head rows
+- [references/duckdb.md](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/references/duckdb.md): local cache behavior
+- [references/tables.md](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/references/tables.md): accumulated table notes that this skill updates
 
 ## Inputs
 
-### Required
+### SQL export path
 
-- `file_path`: path to one SQL file
+Required:
 
-### Optional
+- `file_path`: path to one `.sql` file
 
-- `save_path`: output directory for Excel files, default `./files`
-- `file_name`: target Excel file name; if omitted, derive from SQL file name
-- `access-id`: ODPS access ID
-- `access-key`: ODPS access key
-- `project`: ODPS project
-- `endpoint`: ODPS endpoint
-- `duckdb-path`: DuckDB database path, default `warehouse.db`
-- `duckdb-table`: table name for local persistence
-- `lifecycle`: retention days for the DuckDB table, default `30`
+Optional:
+
+- `save_path`
+- `file_name`
+- `access-id`
+- `access-key`
+- `project`
+- `endpoint`
+- `duckdb-path`
+- `duckdb-table`
+- `lifecycle`
+
+### SQL snippet extraction path
+
+Required:
+
+- `--input-dir`: directory containing `.sql`, `.txt`, or `.ipynb` snippets
+
+Optional:
+
+- `--output`: target markdown path, default `references/tables.md`
+- `--include-ext`
+
+### Known table metadata sync path
+
+Use exactly one of:
+
+- `--table-name <project.table_or_schema.table>`
+- `--mock-metadata-json <fixture.json>`
+
+Optional:
+
+- `--tables-md`: markdown file to update, default `references/tables.md`
+- `--sample-limit`: head row count, default `5`, max `10`
+- `--skip-ddl`
+- `--skip-head`
+- `--print-only`
+- ODPS credentials through args or env when `--table-name` is used
+
+### Ground-truth bootstrap path
+
+Required:
+
+- `--source-md`: an existing markdown file containing trusted table sections
+
+Optional:
+
+- `--target-md`: output markdown path, default `references/tables.md`
+- `--replace`: overwrite target instead of merge
 
 ### Environment variables supported
 
+- `ODPS_ACCESS_KEY_ID`
+- `ODPS_ACCESS_KEY_SECRET`
+- `ODPS_PROJECT`
+- `ODPS_ENDPOINT`
 - `ALIBABA_CLOUD_ACCESS_KEY_ID`
 - `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
 - `ALIBABA_CLOUD_PROJECT_JINGYING`
 - `ALIBABA_CLOUD_REGION_ENDPOINT`
 
-## Outputs
+## Outputs and side effects
 
-### Always attempted
+### SQL export path
 
-- one Excel file: `{save_path}/{base_name}.xlsx`
+- creates one Excel file under `save_path`
+- optionally creates or replaces one DuckDB table
+- optionally updates `__table_lifecycle`
 
-### Conditionally attempted
+### SQL snippet extraction path
 
-- one DuckDB table in `duckdb-path` when `duckdb-table` is provided
-- one lifecycle metadata record in `__table_lifecycle`
+- creates or overwrites `references/tables.md` with SQL-derived table usage notes
 
-## Execution contract for agents
+### Known table metadata sync path
 
-An agent using this skill should follow this exact order:
+- creates or updates one `## <table_name>` section in `references/tables.md`
+- writes field names, data types, column comments, optional sample rows, and optional DDL
+- preserves other table sections in the same markdown file
 
-1. verify `file_path` exists and is a file
-2. verify ODPS credentials are present through args or env
-3. read SQL text exactly as-is from disk
-4. execute the SQL in ODPS
-5. wait for success before reading results
-6. fetch into pandas
-7. if DataFrame is empty, stop and report “No data returned. Skipping exports.”
-8. determine `base_name`
-9. export Excel
-10. if `duckdb-table` is set:
-   - validate table name
-   - validate `lifecycle > 0`
-   - cleanup expired tables
-   - write `CREATE OR REPLACE TABLE`
-   - upsert lifecycle metadata
+### Ground-truth bootstrap path
 
-Do not reorder these steps.
+- creates or updates `references/tables.md` from an existing trusted markdown source
+- preserves trusted `原始字段` / `字段加工` sections as the seed layer before live ODPS enrichment
 
-## Safety boundaries
+## Failure modes
 
-### 1. DuckDB table names are restricted
-
-Only allow identifiers matching:
-
-```regex
-[A-Za-z_][A-Za-z0-9_]*
-```
-
-Reject names with spaces, hyphens, dots, quotes, schema prefixes, or SQL fragments.
-
-### 2. Empty result means no export
-
-If the query returns an empty DataFrame, do **not** create Excel or DuckDB outputs.
-
-### 3. Lifecycle must be positive
-
-If `duckdb-table` is provided, `lifecycle` must be greater than `0`.
-
-### 4. Scope is one SQL file
-
-This skill is intentionally scoped to **one** SQL file at a time. The directory-processing branch is not active and should not be assumed available.
-
-### 5. This skill is execution-oriented, not SQL-authoring-oriented
-
-The skill executes an existing SQL file. It should not silently rewrite SQL logic unless the caller explicitly asks for SQL modification.
-
-## Decision rules for agents
-
-Use this skill when:
-
-- the task is “run this SQL file”
-- the task is “export SQL result to Excel”
-- the task is “cache SQL result locally in DuckDB”
-- the user wants a reproducible ODPS → pandas → Excel / DuckDB workflow
-
-Do **not** use this skill when:
-
-- the input is raw SQL text with no file context and the surrounding workflow expects editing/review first
-- the task requires batch execution of a whole SQL folder
-- the task requires writing back to ODPS tables rather than local export
-- the task requires Excel formatting beyond plain `to_excel(...)`
-- the task requires DuckDB schema migrations, indexing strategy, or advanced incremental merge logic
-
-## Failure modes to surface clearly
-
-Agents should report the exact stage that failed:
+Report the failing stage explicitly.
 
 - SQL file read failure
 - ODPS authentication/config failure
@@ -181,113 +176,199 @@ Agents should report the exact stage that failed:
 - DuckDB connection or write failure
 - invalid DuckDB table name
 - invalid lifecycle value
+- table metadata input failure
+- table metadata fetch failure
+- tables.md update failure
+- ground-truth bootstrap failure
 
-Avoid vague summaries like “execution failed”. Name the failing stage.
+## Decision rules
 
-## Expected references usage
+Use this skill when:
 
+- the task is "run this SQL file in ODPS"
+- the task is "export this SQL result to Excel"
+- the task is "cache this SQL result in DuckDB"
+- the task is "extract which physical tables and fields appear in these SQL snippets"
+- the task is "I know the table name, fetch its schema / DDL / sample rows and append them into `tables.md`"
+- the task is "seed this skill's `tables.md` from another trusted `tables.md`"
 
-### `references/duckdb.md`
-Use this to understand:
+Do not use this skill when:
 
-- why DuckDB is being used
-- the meaning of `__table_lifecycle`
-- retention and cleanup expectations
-- local analytical reuse patterns after export
+- the user needs a new SQL script authored from scratch
+- the task needs batch scheduling of many SQL files with dependencies
+- the task needs writes back into ODPS tables as the primary output
+- the task needs advanced DuckDB schema migration or merge logic
 
-### `references/pythonodps.md`
-Use this to understand:
+## Canonical workflows
 
-- how the `pyodps` package maps to `from odps import ODPS`
-- which constructor fields and environment values are required
-- how `run_sql`, `wait_for_success`, `get_logview_address`, and `open_reader` fit together
-- why `tunnel=True` matters for export workflows in DataWorks environments
-- common package / endpoint / Tunnel / pandas materialization failure modes
+### 1. Run one SQL file and export Excel
 
-## Expected scripts usage
+1. verify `file_path` exists
+2. resolve ODPS credentials
+3. read SQL exactly as-is
+4. execute SQL
+5. wait for success
+6. fetch rows into pandas
+7. stop early on empty result
+8. write Excel
+9. optionally write DuckDB
 
-### `scripts/run_sql_export.py`
-Canonical implementation of the workflow described in this skill.
+### 2. Extract table usage from SQL snippets
 
-### `scripts/example.env`
-Minimal environment-variable template for ODPS credentials.
+1. point `extract_tables_from_sql_snippets.py` at a snippets directory
+2. generate `references/tables.md`
+3. if physical schema is also needed, run the metadata sync workflow afterward for specific tables
 
-### `scripts/example_command.sh`
-Example CLI invocations for:
+### 3. Sync known table metadata into `tables.md`
 
-- Excel-only export
-- Excel + DuckDB export
-- custom output file naming
+1. resolve metadata source: live ODPS or mock JSON
+2. collect columns from `table.table_schema`
+3. optionally collect DDL from `table.get_ddl(...)`
+4. optionally collect sample rows from `table.head(...)`
+5. upsert the table section into `references/tables.md`
+6. report the updated file path and synchronized table name
 
-## Minimal invocation patterns
+Do not silently rewrite unrelated sections in `tables.md`.
 
-### Excel only
+### 4. Bootstrap `tables.md` from a trusted source markdown
+
+1. read the source markdown
+2. extract the `# tables` content
+3. merge or replace into `references/tables.md`
+4. preserve existing target content unless `--replace` is explicitly used
+5. report source and target paths
+
+## Scripts index
+
+### [scripts/run_sql_export.py](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/scripts/run_sql_export.py)
+
+Canonical ODPS SQL -> pandas -> Excel / DuckDB execution path.
+
+### [scripts/extract_tables_from_sql_snippets.py](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/scripts/extract_tables_from_sql_snippets.py)
+
+Offline SQL parser that extracts source tables, raw fields, and transformed expressions from snippet files.
+
+### [scripts/sync_table_metadata.py](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/scripts/sync_table_metadata.py)
+
+Known-table metadata synchronizer. It fetches field names, data types, comments, optional sample rows, and optional DDL, then upserts the result into `references/tables.md`.
+
+Mock mode exists specifically for local validation and contract testing.
+
+### [scripts/bootstrap_tables_reference.py](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/scripts/bootstrap_tables_reference.py)
+
+Seed `references/tables.md` from an existing trusted markdown source, such as the SQL generator skill's `tables.md`. Use this when table names and raw fields are already known ground truth and should become the baseline for later ODPS metadata sync.
+
+## References index
+
+### [references/pythonodps.md](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/references/pythonodps.md)
+
+Use for SQL execution and result export.
+
+### [references/table-metadata.md](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/references/table-metadata.md)
+
+Use for table metadata sync. This file maps the workflow to official PyODPS APIs:
+
+- `odps.get_table(...)`
+- `table.table_schema.columns`
+- `table.table_schema.partitions`
+- `table.get_ddl(...)`
+- `table.head(...)`
+
+### [references/tables.md](C:/Users/haotian.liu/Documents/GitHub/xyf-competition-mvp/.agents/skills/dataworks/references/tables.md)
+
+Target artifact for extracted table notes and synchronized table metadata.
+
+This file can also be bootstrapped from another skill's trusted `tables.md`.
+
+## Minimal runnable paths
+
+### Local smoke path without ODPS credentials
 
 ```bash
-python scripts/run_sql_export.py path/to/query.sql --save_path ./files
+python .agents/skills/dataworks/scripts/sync_table_metadata.py \
+  --mock-metadata-json .agents/skills/dataworks/tests/fixtures/mock_table_metadata.json \
+  --tables-md .agents/skills/dataworks/tests/tmp_tables.md
 ```
 
-### Excel + DuckDB cache
+Expected success criteria:
+
+- exit code `0`
+- target markdown file exists
+- markdown contains the target table heading
+- markdown contains field names, data types, sample row section, and DDL section
+
+### Live ODPS metadata sync
 
 ```bash
-python scripts/run_sql_export.py path/to/query.sql \
-  --save_path ./files \
-  --duckdb-path ./warehouse.db \
-  --duckdb-table tmp_result \
-  --lifecycle 30
+python .agents/skills/dataworks/scripts/sync_table_metadata.py \
+  --table-name your_project.your_table \
+  --tables-md .agents/skills/dataworks/references/tables.md \
+  --sample-limit 5
 ```
 
-### Explicit output file name
+Expected success criteria:
+
+- exit code `0`
+- `references/tables.md` contains `## your_project.your_table`
+- field list reflects `table.table_schema`
+- sample row section is present unless `--skip-head`
+- DDL section is present unless `--skip-ddl`
+
+### Bootstrap from trusted markdown
 
 ```bash
-python scripts/run_sql_export.py path/to/query.sql \
-  --save_path ./files \
-  --file_name monthly_report.xlsx
+python .agents/skills/dataworks/scripts/bootstrap_tables_reference.py \
+  --source-md .agents/skills/sql-generator/references/tables.md \
+  --target-md .agents/skills/dataworks/references/tables.md
 ```
 
-## Agent-facing checklist
+Expected success criteria:
+
+- exit code `0`
+- target markdown contains trusted table sections from the source file
+- later metadata sync can continue appending DDL and sample rows per table
+
+### Live SQL export
+
+```bash
+python .agents/skills/dataworks/scripts/run_sql_export.py path/to/query.sql --save_path ./files
+```
+
+## Negative-path checks
+
+At least one of these should be testable:
+
+- metadata sync with neither `--table-name` nor `--mock-metadata-json`
+- metadata sync with malformed mock JSON
+- metadata sync with `--sample-limit 0`
+- bootstrap with missing `--source-md`
+- SQL export with missing SQL file
+- SQL export with missing credentials
+- DuckDB export with unsafe `--duckdb-table`
+
+## Agent checklist
 
 Before execution:
 
-- confirm the input is a file
-- confirm ODPS credentials are resolvable
-- confirm output directory exists or can be created by the caller
-- confirm DuckDB table name is safe if DuckDB output is requested
+- choose the right workflow: export, snippet extraction, or metadata sync
+- verify required inputs are present
+- prefer mock mode when only local verification is needed
+- keep live ODPS calls explicit
 
 After execution:
 
-- report Logview availability
-- report row count and column names if available
-- report Excel output path
-- report DuckDB output path/table if used
-- report lifecycle expiry time if DuckDB was used
+- report output artifact path
+- report updated table name when `tables.md` changed
+- report row count / columns for SQL export when available
+- report skipped sections such as DDL or head rows when intentionally disabled
+- when bootstrapping, state that source markdown is treated as the trusted seed layer
 
 ## Non-goals
 
 This skill does not define:
 
-- SQL linting or templating
-- SQL semantic validation against business logic
-- Excel styling or pivot generation
-- multi-file dependency scheduling
-- incremental CDC loading into DuckDB
-- data quality assertions beyond empty/non-empty result detection
-
-## Implementation notes distilled from the Python flow
-
-- SQL execution is asynchronous at submission time, but the workflow becomes blocking before result retrieval
-- result loading uses Arrow reader + pandas conversion with `multiprocessing.cpu_count()` parallelism
-- the current implementation prints status and errors instead of raising a structured result object
-- DuckDB cache cleanup is metadata-driven via `__table_lifecycle`
-- table writes are `CREATE OR REPLACE`, so this is overwrite semantics, not append semantics
-
-## Recommended extension path
-
-If this skill grows later, extend in this order:
-
-1. structured return object instead of print-only logging
-2. optional row-limit support that is truly enforced at fetch/export stage
-3. output-directory creation and validation
-4. batch SQL directory mode behind an explicit flag
-5. optional data quality checks before export
-6. richer DuckDB modes such as append/merge with explicit keys
+- SQL linting or SQL generation
+- multi-file SQL dependency orchestration
+- semantic business interpretation of column meaning beyond what is explicitly fetched
+- advanced Excel formatting
+- advanced DuckDB merge or CDC behavior

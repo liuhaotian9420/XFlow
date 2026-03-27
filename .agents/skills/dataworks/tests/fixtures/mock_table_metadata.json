@@ -1,0 +1,44 @@
+{
+  "table_name": "demo_project.sales_order_di",
+  "columns": [
+    {
+      "name": "order_id",
+      "type": "string",
+      "comment": "primary order id",
+      "kind": "column"
+    },
+    {
+      "name": "buyer_id",
+      "type": "string",
+      "comment": "buyer user id",
+      "kind": "column"
+    },
+    {
+      "name": "pay_amount",
+      "type": "decimal(18,2)",
+      "comment": "paid amount",
+      "kind": "column"
+    },
+    {
+      "name": "ds",
+      "type": "string",
+      "comment": "partition date",
+      "kind": "partition"
+    }
+  ],
+  "ddl": "CREATE TABLE demo_project.sales_order_di (\n  order_id STRING COMMENT 'primary order id',\n  buyer_id STRING COMMENT 'buyer user id',\n  pay_amount DECIMAL(18,2) COMMENT 'paid amount'\n)\nPARTITIONED BY (\n  ds STRING COMMENT 'partition date'\n);",
+  "sample_rows": [
+    {
+      "order_id": "o_1001",
+      "buyer_id": "u_01",
+      "pay_amount": "128.50",
+      "ds": "2026-03-27"
+    },
+    {
+      "order_id": "o_1002",
+      "buyer_id": "u_02",
+      "pay_amount": "256.00",
+      "ds": "2026-03-27"
+    }
+  ]
+}

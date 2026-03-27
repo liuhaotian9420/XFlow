@@ -45,6 +45,16 @@ class SkillGalleryItem:
     prompt_hint: str
 
 
+@st.cache_data(show_spinner=False, ttl=10)
+def _cached_skill_items(repo_root_str: str) -> list[SkillGalleryItem]:
+    return _collect_skill_items(Path(repo_root_str))
+
+
+@st.cache_data(show_spinner=False, ttl=10)
+def _cached_artifact_items(repo_root_str: str) -> list[ArtifactGalleryItem]:
+    return _collect_artifact_items(Path(repo_root_str))
+
+
 @st.dialog("Sync GitLab")
 def _show_sync_gitlab_dialog() -> None:
     st.info("敬请期待")
@@ -53,7 +63,7 @@ def _show_sync_gitlab_dialog() -> None:
 
 def render_skills_tab() -> None:
     repo_root = Path(__file__).resolve().parent.parent
-    skill_items = _collect_skill_items(repo_root)
+    skill_items = _cached_skill_items(str(repo_root))
 
     hero_col, action_col = st.columns([10, 0.1], gap="small", vertical_alignment="center")
     with hero_col:
@@ -76,7 +86,7 @@ def render_skills_tab() -> None:
 
 def render_artifacts_tab() -> None:
     repo_root = Path(__file__).resolve().parent.parent
-    artifact_items = _collect_artifact_items(repo_root)
+    artifact_items = _cached_artifact_items(str(repo_root))
 
     st.markdown(
         """
