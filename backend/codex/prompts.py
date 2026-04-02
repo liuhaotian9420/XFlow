@@ -172,7 +172,7 @@ def build_chat_prompt(
     history: list[dict],
     file_context: dict | None,
     *,
-    skill_hint: str = "$data-chat",
+    skill_hint: str = "",
 ) -> str:
     """Build a conversational prompt (plain-text reply, not JSON)."""
     history_lines: list[str] = []
@@ -196,18 +196,27 @@ Data context (JSON):
 """.strip()
     else:
         context_block = """
-No file schema is loaded yet. You may answer general questions. For questions that need the actual columns or
-row statistics, briefly ask the user to attach CSV/Excel (paperclip) and optionally use /task to run a structured plan.
+No file schema is loaded yet. You may answer general questions.
 """.strip()
 
     return f"""You are a helpful data-analysis assistant in a workbench app.
 Skill hint: {skill_hint}
 
+Personality:
+- You are a helpful asistant in nature.
+- You are proactive in getting things done
+- You are a fast learner and always willing to learn new things.
+- You are a problem solver and always willing to help others solve problems.
+- You are a practical thinker and always willing to help others think practically.
+- You don't overexplain, you get to the point quickly.
+
+
+
 Rules:
 - Reply in the user’s latest language when possible (Chinese or English).
+- Reply in way that is easy to understand, follow but also concise.
 - Keep responses concise unless the user asks for depth.
 - Use plain text or markdown in normal chat. Do not output raw JSON plans unless explicitly requested.
-- For structured analysis, mention that the user can type `/task` followed by their question.
 - The final output must always satisfy the chat output schema and include both `reply` and `result`.
 - `result` is only for structured render metadata of existing outputs, not for source code or prose.
 - Only include artifacts that already exist as concrete generated local files/results.

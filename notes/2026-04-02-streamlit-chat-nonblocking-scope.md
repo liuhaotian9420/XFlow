@@ -439,3 +439,80 @@ This section records what has already been implemented in backend for Phase 1.
 - Backend-only Phase 1 is implemented here.
 - No frontend changes are included in this update.
 - `DELETE /chat/jobs/{job_id}` is not implemented yet.
+
+### Post-implementation fix (job stuck/error propagation)
+
+After initial backend rollout, a follow-up backend-only fix was applied for job liveness and error visibility:
+
+1. Error event now terminates job status
+   - Job registry now treats `type="error"` as terminal `failed`.
+   - This prevents polling from showing long-running `running` state after an actual backend error already happened.
+
+2. Stream loop exits earlier on error event
+   - Shared stream iterator now yields the error event and breaks out of the stream loop.
+   - This improves front-end observability and reduces long hangs waiting for an absent final event.
+
+3. Added lightweight debug pointer
+   - Job snapshot now includes `last_event_type`.
+   - Frontend can quickly inspect whether latest progression is `final`, `error`, or intermediate events.
+
+### Logging visibility fix (backend)
+
+If backend showed no logs in terminal, logging initialization could be too weak for app loggers.
+
+Applied backend fix:
+
+- `backend/main.py`
+  - Added explicit app logging bootstrap (`_configure_app_logging()`).
+  - Ensures root and app namespaces (`xyf.*`, `backend.*`) emit at `INFO` by default.
+  - Supports env override `APP_LOG_LEVEL` (default `INFO`).
+- `scripts/run_uvicorn_windows.py`
+  - Added `--access-log` flag passthrough to uvicorn for HTTP access logs when needed.
+
+Suggested local startup for diagnosis:
+
+- `python scripts/run_uvicorn_windows.py --log-level info --access-log`
+- optional:
+  - `set APP_LOG_LEVEL=DEBUG` (Windows cmd)
+  - `$env:APP_LOG_LEVEL='DEBUG'` (PowerShell)
+
+### Frontend Integration Notes (Important)
+
+These details are useful for frontend integration now and should be treated as current backend behavior.
+
+1. Job status transitions
+   - Typical path: `queued -> running -> completed`
+   - Failure path: `queued/running -> failed`
+   - `completed` and `failed` are terminal states for polling.
+
+2. Polling recommendation
+   - Suggested polling interval: `0.5s` to `1.0s`
+   - Stop polling when terminal state is reached.
+
+3. In-flight fields vs final fields
+   - During `queued/running`, rely on:
+     - `latest_text`
+     - `latest_reasoning_text`
+     - `latest_command`
+     - `stream_events` (debug/optional)
+   - On `completed`, rely on:
+     - `final_reply`
+     - `timing`
+     - `usage`
+     - `runtime_vendor`, `runtime_binary`
+
+4. Error handling expectations
+   - `failed` state exposes `error`.
+   - Some completed jobs may still carry an `error` field when fallback happened but a final reply was produced.
+   - Frontend should treat `status=completed` as successful completion regardless of optional warning/error text.
+
+5. Session/history consistency
+   - `session_id` and `turn_id` are available in job snapshot.
+   - Final turn persistence still happens in backend chat turn store.
+   - Frontend should keep using session/turn APIs for durable history restoration.
+
+6. Current backend limits (Phase 1)
+   - Job registry is in-memory only (not persisted).
+   - Process restart clears in-flight job snapshots.
+   - The registry is process-local (no cross-process coordination in this phase).
+   - `stream_events` are capped in-memory (to avoid unbounded growth).

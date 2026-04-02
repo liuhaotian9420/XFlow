@@ -49,6 +49,8 @@ Do not treat this skill as a generic SQL authoring or multi-job orchestration sk
 │  ├─ pythonodps.md
 │  ├─ table-metadata.md
 │  ├─ tables.md
+│  ├─ by_table
+│     └─ index.md
 │  └─ prompts/
 │     └─ table_extraction.md
 ├─ scripts/

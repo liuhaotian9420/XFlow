@@ -2,11 +2,18 @@
 
 | 表名 | 来源文件数 | 详情 |
 | --- | --- | --- |
+| xyf_ads.ads_feature_custno_app_customer_df | 1 | [详情](./xyf_ads.ads_feature_custno_app_customer_df.md) |
+| xyf_ads.ads_fin_clear_loan_df_02_00 | 1 | [详情](./xyf_ads.ads_fin_clear_loan_df_02_00.md) |
 | xyf_ads.ads_fin_onloan_fee_df | 1 | [详情](./xyf_ads.ads_fin_onloan_fee_df.md) |
 | xyf_ads.ads_inloan_loan_balance_mthly_df_01 | 1 | [详情](./xyf_ads.ads_inloan_loan_balance_mthly_df_01.md) |
 | xyf_ads.ads_inloan_loan_monitor_screen_df | 1 | [详情](./xyf_ads.ads_inloan_loan_monitor_screen_df.md) |
 | xyf_ads.ads_user_market_portfolio_label_df | 1 | [详情](./xyf_ads.ads_user_market_portfolio_label_df.md) |
+| xyf_ads.bi_ts_gd_wide_table_v3 | 1 | [详情](./xyf_ads.bi_ts_gd_wide_table_v3.md) |
+| xyf_bi.fk_risk_order_feature_df_forbi | 1 | [详情](./xyf_bi.fk_risk_order_feature_df_forbi.md) |
+| xyf_bi.wzq_order_table | 1 | [详情](./xyf_bi.wzq_order_table.md) |
 | xyf_bi_dev.amt_predict_oct24_v2 | 1 | [详情](./xyf_bi_dev.amt_predict_oct24_v2.md) |
+| xyf_bi_dev.api_app_2_ord_v1120 | 1 | [详情](./xyf_bi_dev.api_app_2_ord_v1120.md) |
+| xyf_bi_dev.kesu_users | 1 | [详情](./xyf_bi_dev.kesu_users.md) |
 | xyf_dim.dim_pub_date | 10 | [详情](./xyf_dim.dim_pub_date.md) |
 | xyf_dwd.dwd_inloan_leap_vip_order_hf | 5 | [详情](./xyf_dwd.dwd_inloan_leap_vip_order_hf.md) |
 | xyf_dwd.dwd_inloan_loan_apply_main_df | 2 | [详情](./xyf_dwd.dwd_inloan_loan_apply_main_df.md) |
@@ -28,3 +35,5 @@
 | xyf_fengkong_dev.wzq_order_b5_b4_compare_base | 1 | [详情](./xyf_fengkong_dev.wzq_order_b5_b4_compare_base.md) |
 | xyf_fengkong_dev.zsh_tek_fk_ord_flg | 1 | [详情](./xyf_fengkong_dev.zsh_tek_fk_ord_flg.md) |
 | xyf_fengkong_dev.zsh_vip_fk_ord_flg | 1 | [详情](./xyf_fengkong_dev.zsh_vip_fk_ord_flg.md) |
+| xyf_jingying.weekly_analysis_report_df_lss | 1 | [详情](./xyf_jingying.weekly_analysis_report_df_lss.md) |
+| xyf_jingying_dev.lss_ewfk_first_loan_info | 0 | [详情](./xyf_jingying_dev.lss_ewfk_first_loan_info.md) |

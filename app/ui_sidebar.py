@@ -25,7 +25,12 @@ from app.streamlit_state import (
     _invalidate_schema_cache,
     _restore_chat_messages_from_turns,
 )
-
+from pathlib import Path
+import sys
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+_BRAND_LOGO_PATH = _REPO_ROOT / "logo.png"
 
 def _load_runtime_status() -> dict[str, Any] | None:
     cached = st.session_state.get("_runtime_status_cache")
@@ -130,7 +135,19 @@ def _render_workspace_summary() -> None:
 
 def _render_system_section(runtime_status: dict[str, Any] | None) -> None:
     summary, issues = _runtime_summary(runtime_status)
-
+    brand_col, title_col = st.columns([3,9], vertical_alignment="center")  
+    with brand_col:
+        if _BRAND_LOGO_PATH.is_file():
+            st.image(str(_BRAND_LOGO_PATH), width=72)
+    with title_col:
+        st.markdown(
+            """
+            <h1 class="xyf-page-title">
+                XFactors 出品
+            </h1>
+            """,
+            unsafe_allow_html=True,
+        )
     st.markdown('<div class="xyf-sidebar-system">', unsafe_allow_html=True)
     st.markdown(
         (
@@ -301,3 +318,14 @@ def render_sidebar() -> None:
         else:
             for item in st.session_state.task_history_cache[:5]:
                 _render_recent_task_card(item)
+        st.markdown('<div class="xyf-sidebar-system">', unsafe_allow_html=True)
+        st.markdown(
+            (
+                '<div class="xyf-sidebar-system-row">'
+                f'<div class="xyf-sidebar-system-title">Maintainer: 昊天</div>'
+                f'<div class="xyf-sidebar-system-copy">Powered by Xinfei-codex</div>'
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)

@@ -12,8 +12,7 @@ from app.api_client import _post_create_review_request
 WELCOME_MESSAGE_MARKDOWN = (
     "**你好呀，欢迎和我对话，你可以**\n\n"
     "- 1. 直接提问，先用自然语言和数据对话。\n"
-    "- 2. 输入 **`/task`** + 分析问题，生成计划后确认执行。\n"
-    "- 3. 通过聊天框上传 **CSV / Excel** 文件。\n\n"
+    "- 2. 可以通过聊天框上传 **CSV / Excel** 文件。\n\n"
     "准备好后，直接在下方输入问题。"
 )
 

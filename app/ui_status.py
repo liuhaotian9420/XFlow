@@ -50,6 +50,44 @@ def inject_global_styles() -> None:
             color: rgba(49, 51, 63, 0.76);
             max-width: 52rem;
         }
+        .xyf-topic-hero {
+            border-color: rgba(19, 93, 91, 0.14);
+            background: linear-gradient(135deg, rgba(236, 251, 247, 0.98), rgba(240, 247, 232, 0.98));
+        }
+        .xyf-topic-card-head {
+            margin-bottom: 0.55rem;
+        }
+        .xyf-topic-badge {
+            display: inline-flex;
+            align-items: center;
+            min-height: 1.5rem;
+            padding: 0.08rem 0.58rem;
+            border-radius: 999px;
+            background: rgba(19, 93, 91, 0.10);
+            color: rgb(19, 93, 91);
+            font-size: 0.76rem;
+            font-weight: 600;
+            margin-bottom: 0.38rem;
+        }
+        .xyf-topic-card-title {
+            font-size: 1.02rem;
+            font-weight: 700;
+            line-height: 1.3;
+            color: rgb(24, 42, 41);
+            margin-bottom: 0.2rem;
+        }
+        .xyf-topic-card-copy {
+            font-size: 0.91rem;
+            color: rgba(36, 49, 48, 0.78);
+            line-height: 1.45;
+        }
+        .xyf-topic-card-time {
+            margin-top: 0.45rem;
+            font-size: 0.78rem;
+            color: rgba(19, 93, 91, 0.82);
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
         .xyf-artifact-list-shell {
             border: 1px solid rgba(49, 51, 63, 0.10);
             border-radius: 1rem;
