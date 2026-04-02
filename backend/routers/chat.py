@@ -7,11 +7,14 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from backend.chat_jobs import CHAT_JOBS
 from backend.chat_store import (
     delete_all_sessions,
     delete_session,
@@ -114,6 +117,48 @@ class ChatResponse(BaseModel):
     api_elapsed_s: float | None = None
     runtime_vendor: str | None = None
     runtime_binary: str | None = None
+
+
+class ChatExecutionContext(BaseModel):
+    payload: ChatRequest
+    use_mock: bool | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    think_level: str | None = None
+    timeout_seconds: int | None = None
+    auto_timeout: bool = False
+    include_prompt_debug: bool = False
+    chat_id: str
+    session_id: str
+    turn_id: str
+    history: list[dict[str, str]]
+    explicit: bool | None = None
+    use_mock_flag: bool
+    effective_reasoning: str | None = None
+    provider_name: str
+    adapter_command: str
+    resolved_codex: str
+    adapter: Any
+
+
+class ChatJobSnapshot(BaseModel):
+    job_id: str
+    status: str
+    created_at: float
+    updated_at: float
+    session_id: str
+    turn_id: str
+    chat_id: str
+    latest_text: str = ""
+    latest_reasoning_text: str = ""
+    latest_command: dict[str, Any] | None = None
+    stream_events: list[dict[str, Any]] = Field(default_factory=list)
+    final_reply: str | None = None
+    timing: dict[str, Any] = Field(default_factory=dict)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    runtime_vendor: str | None = None
+    runtime_binary: str | None = None
+    error: str | None = None
 
 
 def _chat_runtime_fields(
@@ -231,6 +276,280 @@ def _save_chat_turn_record(
             ),
         }
     )
+
+
+def _build_chat_context(
+    *,
+    payload: ChatRequest,
+    use_mock: bool | None,
+    model: str | None,
+    reasoning_effort: str | None,
+    think_level: str | None,
+    timeout_seconds: int | None,
+    auto_timeout: bool,
+    include_prompt_debug: bool,
+) -> ChatExecutionContext:
+    text = payload.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="message must not be empty")
+    chat_id = str(uuid.uuid4())
+    session_id = (payload.session_id or "").strip() or str(uuid.uuid4())
+    turn_id = str(uuid.uuid4())
+    history = [m.model_dump() for m in payload.history]
+    explicit = use_mock if use_mock is not None else payload.use_mock
+    use_mock_flag = _effective_use_mock(explicit)
+    effective_reasoning = _effective_reasoning_effort(reasoning_effort, think_level)
+    effective_timeout_seconds = resolve_timeout_seconds(
+        auto_timeout=auto_timeout,
+        explicit_timeout_seconds=timeout_seconds,
+        route_kind="chat",
+        model=model,
+        reasoning_effort=effective_reasoning,
+        env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+    )
+    adapter = get_provider(
+        use_mock_flag,
+        model=model,
+        reasoning_effort=effective_reasoning,
+        timeout_seconds=effective_timeout_seconds,
+    )
+    resolved_codex = resolve_codex_executable()
+    adapter_command = str(getattr(adapter, "command", "") or "").strip() or resolved_codex
+    provider_name = type(adapter).__name__
+    return ChatExecutionContext(
+        payload=payload,
+        use_mock=use_mock,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        think_level=think_level,
+        timeout_seconds=timeout_seconds,
+        auto_timeout=auto_timeout,
+        include_prompt_debug=include_prompt_debug,
+        chat_id=chat_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        history=history,
+        explicit=explicit,
+        use_mock_flag=use_mock_flag,
+        effective_reasoning=effective_reasoning,
+        provider_name=provider_name,
+        adapter_command=adapter_command,
+        resolved_codex=resolved_codex,
+        adapter=adapter,
+    )
+
+
+async def _iter_chat_events(ctx: ChatExecutionContext) -> AsyncIterator[dict[str, Any]]:
+    text = ctx.payload.message.strip()
+    provider_elapsed_s: float | None = None
+    provider_overhead_elapsed_s: float | None = None
+    error_text: str | None = None
+    is_fallback = False
+    final_reply: str | None = None
+    final_emitted = False
+    error_emitted = False
+    saved = False
+    t0 = time.perf_counter()
+    try:
+        p0 = time.perf_counter()
+        if isinstance(ctx.adapter, MockProvider):
+            scripted_events = next_stream_events(ctx.session_id)
+            provider_elapsed_s = time.perf_counter() - p0
+            runtime_vendor, runtime_binary = _chat_runtime_fields(
+                adapter=ctx.adapter,
+                is_fallback=False,
+                use_mock_flag=ctx.use_mock_flag,
+            )
+            if scripted_events:
+                for raw_event in scripted_events:
+                    event = dict(raw_event)
+                    event["chat_id"] = ctx.chat_id
+                    event["session_id"] = ctx.session_id
+                    event["turn_id"] = ctx.turn_id
+                    if str(event.get("type") or "").strip().lower() == "final":
+                        final_reply = str(event.get("reply") or "").strip() or None
+                        final_emitted = True
+                        event["runtime_vendor"] = runtime_vendor
+                        event["runtime_binary"] = runtime_binary
+                        event.setdefault("timing", {})
+                        if isinstance(event["timing"], dict):
+                            event["timing"]["provider_elapsed_s"] = provider_elapsed_s
+                            event["timing"]["api_elapsed_s"] = time.perf_counter() - t0
+                    yield event
+                if final_emitted:
+                    return
+            reply = await ctx.adapter.chat(
+                message=text,
+                history=ctx.history,
+                file_context=ctx.payload.file_context,
+                task_id=ctx.session_id,
+            )
+            final_event = {
+                "type": "final",
+                "chat_id": ctx.chat_id,
+                "session_id": ctx.session_id,
+                "turn_id": ctx.turn_id,
+                "reply": reply,
+                "timing": {
+                    "provider_elapsed_s": provider_elapsed_s,
+                    "api_elapsed_s": time.perf_counter() - t0,
+                },
+                "runtime_vendor": runtime_vendor,
+                "runtime_binary": runtime_binary,
+            }
+            logger.info(
+                "[CHATDBG][backend][stream_final][mock] chat_id=%s turn_id=%s %s",
+                ctx.chat_id,
+                ctx.turn_id,
+                _reply_debug_summary(reply),
+            )
+            final_reply = reply
+            final_emitted = True
+            yield final_event
+            return
+
+        async for event in ctx.adapter.stream_chat(
+            message=text,
+            history=ctx.history,
+            file_context=ctx.payload.file_context,
+            chat_id=ctx.chat_id,
+        ):
+            event_type = str(event.get("type") or "").strip().lower()
+            if event_type == "error":
+                error_text = str(event.get("error") or "").strip() or error_text
+                error_emitted = True
+            if event_type == "final":
+                provider_elapsed_s = time.perf_counter() - p0
+                codex_exec_elapsed_s = getattr(ctx.adapter, "last_exec_elapsed_s", None)
+                if (
+                    isinstance(provider_elapsed_s, (int, float))
+                    and isinstance(codex_exec_elapsed_s, (int, float))
+                ):
+                    provider_overhead_elapsed_s = max(
+                        0.0, float(provider_elapsed_s) - float(codex_exec_elapsed_s)
+                    )
+                runtime_vendor, runtime_binary = _chat_runtime_fields(
+                    adapter=ctx.adapter,
+                    is_fallback=False,
+                    use_mock_flag=ctx.use_mock_flag,
+                )
+                final_reply = str(event.get("reply") or "").strip() or None
+                event["session_id"] = ctx.session_id
+                event["turn_id"] = ctx.turn_id
+                event["runtime_vendor"] = runtime_vendor
+                event["runtime_binary"] = runtime_binary
+                event.setdefault("timing", {})
+                if isinstance(event["timing"], dict):
+                    event["timing"]["provider_elapsed_s"] = provider_elapsed_s
+                    event["timing"]["provider_overhead_elapsed_s"] = provider_overhead_elapsed_s
+                    event["timing"]["api_elapsed_s"] = time.perf_counter() - t0
+                logger.info(
+                    "[CHATDBG][backend][stream_final] chat_id=%s turn_id=%s %s",
+                    ctx.chat_id,
+                    ctx.turn_id,
+                    _reply_debug_summary(str(event.get("reply") or "")),
+                )
+                final_emitted = True
+            yield event
+
+        if final_reply is None and error_text is None:
+            error_text = "Stream ended without a final reply."
+            yield {
+                "type": "error",
+                "chat_id": ctx.chat_id,
+                "session_id": ctx.session_id,
+                "turn_id": ctx.turn_id,
+                "error": error_text,
+            }
+            error_emitted = True
+    except (CodexAdapterError, Exception) as exc:
+        error_text = f"{type(exc).__name__}: {exc!s}"
+        logger.exception(
+            "CHAT stream failed chat_id=%s after %.2fs use_mock=%s explicit_query=%s provider=%s resolved_codex=%s",
+            ctx.chat_id,
+            time.perf_counter() - t0,
+            ctx.use_mock_flag,
+            ctx.explicit,
+            ctx.provider_name,
+            ctx.resolved_codex,
+        )
+        if not final_emitted and not ctx.use_mock_flag and ctx.explicit is not False:
+            is_fallback = True
+            mock_provider = MockProvider()
+            reply = await mock_provider.chat(
+                message=text,
+                history=ctx.history,
+                file_context=ctx.payload.file_context,
+                task_id=ctx.chat_id,
+            )
+            final_reply = reply
+            runtime_vendor, runtime_binary = _chat_runtime_fields(
+                adapter=ctx.adapter,
+                is_fallback=True,
+                use_mock_flag=ctx.use_mock_flag,
+            )
+            fallback_event = {
+                "type": "final",
+                "chat_id": ctx.chat_id,
+                "session_id": ctx.session_id,
+                "turn_id": ctx.turn_id,
+                "reply": reply,
+                "runtime_vendor": runtime_vendor,
+                "runtime_binary": runtime_binary,
+                "error": error_text,
+                "timing": {
+                    "provider_elapsed_s": provider_elapsed_s,
+                    "api_elapsed_s": time.perf_counter() - t0,
+                },
+            }
+            logger.info(
+                "[CHATDBG][backend][stream_final][fallback] chat_id=%s turn_id=%s %s",
+                ctx.chat_id,
+                ctx.turn_id,
+                _reply_debug_summary(reply),
+            )
+            final_emitted = True
+            yield fallback_event
+            return
+        if not final_emitted and not error_emitted:
+            yield {
+                "type": "error",
+                "chat_id": ctx.chat_id,
+                "session_id": ctx.session_id,
+                "turn_id": ctx.turn_id,
+                "error": error_text,
+                "runtime_vendor": (
+                    "xinfei-codex"
+                    if is_xinfei_enterprise_binary(ctx.adapter_command)
+                    else "native-codex"
+                )
+                if not ctx.use_mock_flag
+                else "mock",
+                "runtime_binary": ctx.adapter_command if not ctx.use_mock_flag else None,
+            }
+            error_emitted = True
+    finally:
+        if not saved:
+            _save_chat_turn_record(
+                turn_id=ctx.turn_id,
+                session_id=ctx.session_id,
+                chat_id=ctx.chat_id,
+                user_message=text,
+                history=ctx.history,
+                use_mock_flag=ctx.use_mock_flag,
+                model=ctx.model,
+                effective_reasoning=ctx.effective_reasoning,
+                provider_name=ctx.provider_name,
+                reply_text=final_reply,
+                is_fallback=is_fallback,
+                error_text=error_text,
+                adapter=ctx.adapter,
+                provider_elapsed_s=provider_elapsed_s,
+                provider_overhead_elapsed_s=provider_overhead_elapsed_s,
+                api_elapsed_s=time.perf_counter() - t0,
+                include_prompt_debug=ctx.include_prompt_debug,
+            )
+            saved = True
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -491,251 +810,81 @@ async def chat_message_stream(
     auto_timeout: bool = Query(default=False, alias="autoTimeout"),
     include_prompt_debug: bool = Query(default=False),
 ) -> StreamingResponse:
-    text = payload.message.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="message must not be empty")
-
-    chat_id = str(uuid.uuid4())
-    session_id = (payload.session_id or "").strip() or str(uuid.uuid4())
-    turn_id = str(uuid.uuid4())
-    history = [m.model_dump() for m in payload.history]
-    explicit = use_mock if use_mock is not None else payload.use_mock
-    use_mock_flag = _effective_use_mock(explicit)
-    effective_reasoning = _effective_reasoning_effort(reasoning_effort, think_level)
-    effective_timeout_seconds = resolve_timeout_seconds(
+    ctx = _build_chat_context(
+        payload=payload,
+        use_mock=use_mock,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        think_level=think_level,
+        timeout_seconds=timeout_seconds,
         auto_timeout=auto_timeout,
-        explicit_timeout_seconds=timeout_seconds,
-        route_kind="chat",
-        model=model,
-        reasoning_effort=effective_reasoning,
-        env_default_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "180")),
+        include_prompt_debug=include_prompt_debug,
     )
-    adapter = get_provider(
-        use_mock_flag,
-        model=model,
-        reasoning_effort=effective_reasoning,
-        timeout_seconds=effective_timeout_seconds,
-    )
-    resolved_codex = resolve_codex_executable()
-    adapter_command = str(getattr(adapter, "command", "") or "").strip() or resolved_codex
-    provider_name = type(adapter).__name__
 
     async def _event_gen():
-        provider_elapsed_s: float | None = None
-        provider_overhead_elapsed_s: float | None = None
-        error_text: str | None = None
-        is_fallback = False
-        final_reply: str | None = None
-        final_emitted = False
-        error_emitted = False
-        saved = False
-        t0 = time.perf_counter()
-        try:
-            p0 = time.perf_counter()
-            if isinstance(adapter, MockProvider):
-                scripted_events = next_stream_events(session_id)
-                provider_elapsed_s = time.perf_counter() - p0
-                runtime_vendor, runtime_binary = _chat_runtime_fields(
-                    adapter=adapter,
-                    is_fallback=False,
-                    use_mock_flag=use_mock_flag,
-                )
-                if scripted_events:
-                    for raw_event in scripted_events:
-                        event = dict(raw_event)
-                        event["chat_id"] = chat_id
-                        event["session_id"] = session_id
-                        event["turn_id"] = turn_id
-                        if str(event.get("type") or "").strip().lower() == "final":
-                            final_reply = str(event.get("reply") or "").strip() or None
-                            final_emitted = True
-                            event["runtime_vendor"] = runtime_vendor
-                            event["runtime_binary"] = runtime_binary
-                            event.setdefault("timing", {})
-                            if isinstance(event["timing"], dict):
-                                event["timing"]["provider_elapsed_s"] = provider_elapsed_s
-                                event["timing"]["api_elapsed_s"] = time.perf_counter() - t0
-                        yield _sse_json(event)
-                    if final_emitted:
-                        return
-                reply = await adapter.chat(
-                    message=text,
-                    history=history,
-                    file_context=payload.file_context,
-                    task_id=session_id,
-                )
-                final_event = {
-                    "type": "final",
-                    "chat_id": chat_id,
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "reply": reply,
-                    "timing": {
-                        "provider_elapsed_s": provider_elapsed_s,
-                        "api_elapsed_s": time.perf_counter() - t0,
-                    },
-                    "runtime_vendor": runtime_vendor,
-                    "runtime_binary": runtime_binary,
-                }
-                logger.info(
-                    "[CHATDBG][backend][stream_final][mock] chat_id=%s turn_id=%s %s",
-                    chat_id,
-                    turn_id,
-                    _reply_debug_summary(reply),
-                )
-                final_reply = reply
-                final_emitted = True
-                yield _sse_json(final_event)
-                return
-
-            async for event in adapter.stream_chat(
-                message=text,
-                history=history,
-                file_context=payload.file_context,
-                chat_id=chat_id,
-            ):
-                event_type = str(event.get("type") or "").strip().lower()
-                if event_type == "error":
-                    error_text = str(event.get("error") or "").strip() or error_text
-                    error_emitted = True
-                if event_type == "final":
-                    provider_elapsed_s = time.perf_counter() - p0
-                    codex_exec_elapsed_s = getattr(adapter, "last_exec_elapsed_s", None)
-                    if (
-                        isinstance(provider_elapsed_s, (int, float))
-                        and isinstance(codex_exec_elapsed_s, (int, float))
-                    ):
-                        provider_overhead_elapsed_s = max(
-                            0.0, float(provider_elapsed_s) - float(codex_exec_elapsed_s)
-                        )
-                    runtime_vendor, runtime_binary = _chat_runtime_fields(
-                        adapter=adapter,
-                        is_fallback=False,
-                        use_mock_flag=use_mock_flag,
-                    )
-                    final_reply = str(event.get("reply") or "").strip() or None
-                    event["session_id"] = session_id
-                    event["turn_id"] = turn_id
-                    event["runtime_vendor"] = runtime_vendor
-                    event["runtime_binary"] = runtime_binary
-                    event.setdefault("timing", {})
-                    if isinstance(event["timing"], dict):
-                        event["timing"]["provider_elapsed_s"] = provider_elapsed_s
-                        event["timing"]["provider_overhead_elapsed_s"] = provider_overhead_elapsed_s
-                        event["timing"]["api_elapsed_s"] = time.perf_counter() - t0
-                    logger.info(
-                        "[CHATDBG][backend][stream_final] chat_id=%s turn_id=%s %s",
-                        chat_id,
-                        turn_id,
-                        _reply_debug_summary(str(event.get("reply") or "")),
-                    )
-                    final_emitted = True
-                yield _sse_json(event)
-
-            if final_reply is None and error_text is None:
-                error_text = "Stream ended without a final reply."
-                yield _sse_json(
-                    {
-                        "type": "error",
-                        "chat_id": chat_id,
-                        "session_id": session_id,
-                        "turn_id": turn_id,
-                        "error": error_text,
-                    }
-                )
-                error_emitted = True
-        except (CodexAdapterError, Exception) as exc:
-            error_text = f"{type(exc).__name__}: {exc!s}"
-            logger.exception(
-                "CHAT stream failed chat_id=%s after %.2fs use_mock=%s explicit_query=%s provider=%s resolved_codex=%s",
-                chat_id,
-                time.perf_counter() - t0,
-                use_mock_flag,
-                explicit,
-                provider_name,
-                resolved_codex,
-            )
-            if not final_emitted and not use_mock_flag and explicit is not False:
-                is_fallback = True
-                mock_provider = MockProvider()
-                reply = await mock_provider.chat(
-                    message=text,
-                    history=history,
-                    file_context=payload.file_context,
-                    task_id=chat_id,
-                )
-                final_reply = reply
-                runtime_vendor, runtime_binary = _chat_runtime_fields(
-                    adapter=adapter,
-                    is_fallback=True,
-                    use_mock_flag=use_mock_flag,
-                )
-                fallback_event = {
-                    "type": "final",
-                    "chat_id": chat_id,
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "reply": reply,
-                    "runtime_vendor": runtime_vendor,
-                    "runtime_binary": runtime_binary,
-                    "error": error_text,
-                    "timing": {
-                        "provider_elapsed_s": provider_elapsed_s,
-                        "api_elapsed_s": time.perf_counter() - t0,
-                    },
-                }
-                logger.info(
-                    "[CHATDBG][backend][stream_final][fallback] chat_id=%s turn_id=%s %s",
-                    chat_id,
-                    turn_id,
-                    _reply_debug_summary(reply),
-                )
-                final_emitted = True
-                yield _sse_json(fallback_event)
-                return
-            if not final_emitted and not error_emitted:
-                yield _sse_json(
-                    {
-                        "type": "error",
-                        "chat_id": chat_id,
-                        "session_id": session_id,
-                        "turn_id": turn_id,
-                        "error": error_text,
-                        "runtime_vendor": (
-                            "xinfei-codex"
-                            if is_xinfei_enterprise_binary(adapter_command)
-                            else "native-codex"
-                        )
-                        if not use_mock_flag
-                        else "mock",
-                        "runtime_binary": adapter_command if not use_mock_flag else None,
-                    }
-                )
-                error_emitted = True
-        finally:
-            if not saved:
-                _save_chat_turn_record(
-                    turn_id=turn_id,
-                    session_id=session_id,
-                    chat_id=chat_id,
-                    user_message=text,
-                    history=history,
-                    use_mock_flag=use_mock_flag,
-                    model=model,
-                    effective_reasoning=effective_reasoning,
-                    provider_name=provider_name,
-                    reply_text=final_reply,
-                    is_fallback=is_fallback,
-                    error_text=error_text,
-                    adapter=adapter,
-                    provider_elapsed_s=provider_elapsed_s,
-                    provider_overhead_elapsed_s=provider_overhead_elapsed_s,
-                    api_elapsed_s=time.perf_counter() - t0,
-                    include_prompt_debug=include_prompt_debug,
-                )
-                saved = True
+        async for event in _iter_chat_events(ctx):
+            yield _sse_json(event)
 
     return StreamingResponse(_event_gen(), media_type="text/event-stream")
+
+
+@router.post("/chat/jobs", response_model=ChatJobSnapshot)
+async def create_chat_job(
+    payload: ChatRequest,
+    use_mock: bool | None = Query(default=None),
+    model: str | None = Query(default=None),
+    reasoning_effort: str | None = Query(default=None),
+    think_level: str | None = Query(default=None),
+    timeout_seconds: int | None = Query(default=None, ge=1, le=3600),
+    auto_timeout: bool = Query(default=False, alias="autoTimeout"),
+    include_prompt_debug: bool = Query(default=False),
+) -> ChatJobSnapshot:
+    ctx = _build_chat_context(
+        payload=payload,
+        use_mock=use_mock,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        think_level=think_level,
+        timeout_seconds=timeout_seconds,
+        auto_timeout=auto_timeout,
+        include_prompt_debug=include_prompt_debug,
+    )
+
+    # We need the id before constructing the async runner closure.
+    job_id = str(uuid.uuid4())
+
+    async def _runner() -> None:
+        async for event in _iter_chat_events(ctx):
+            CHAT_JOBS.append_event(job_id, event)
+
+    snapshot = CHAT_JOBS.create_job(
+        session_id=ctx.session_id,
+        turn_id=ctx.turn_id,
+        chat_id=ctx.chat_id,
+        runner=_runner,
+        job_id=job_id,
+    )
+    CHAT_JOBS.append_event(
+        job_id,
+        {
+            "type": "job.created",
+            "session_id": ctx.session_id,
+            "turn_id": ctx.turn_id,
+            "chat_id": ctx.chat_id,
+        },
+    )
+    out = CHAT_JOBS.get_snapshot(job_id)
+    if out is None:
+        raise HTTPException(status_code=500, detail="Failed to create chat job")
+    return ChatJobSnapshot.model_validate(out)
+
+
+@router.get("/chat/jobs/{job_id}", response_model=ChatJobSnapshot)
+async def get_chat_job(job_id: str) -> ChatJobSnapshot:
+    snapshot = CHAT_JOBS.get_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Chat job not found")
+    return ChatJobSnapshot.model_validate(snapshot)
 
 
 class ChatSessionMeta(BaseModel):

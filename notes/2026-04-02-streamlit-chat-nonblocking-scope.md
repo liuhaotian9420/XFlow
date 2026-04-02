@@ -379,3 +379,63 @@ The lowest-risk implementation strategy is:
 - switch the frontend from inline SSE consumption to job submission plus polling
 
 `st.fragment` is helpful in the final design, but only as the polling/render mechanism. It is not the mechanism that removes blocking.
+
+## Backend Implementation Update (2026-04-02)
+
+This section records what has already been implemented in backend for Phase 1.
+
+### Implemented
+
+1. New in-memory chat job registry
+   - Added `backend/chat_jobs.py`
+   - Provides job lifecycle and polling snapshot:
+     - `queued/running/completed/failed`
+     - latest text/reasoning/command snapshot
+     - capped `stream_events`
+     - final reply and timing/usage/runtime fields
+
+2. Shared chat stream execution path
+   - In `backend/routers/chat.py`, extracted shared execution helpers:
+     - `_build_chat_context(...)`
+     - `_iter_chat_events(...)`
+   - `/chat/stream` now reuses `_iter_chat_events(...)` instead of owning a separate stream loop copy.
+   - This keeps stream behavior and turn persistence semantics aligned for both direct stream and job mode.
+
+3. New chat jobs API
+   - Added `POST /chat/jobs`
+   - Added `GET /chat/jobs/{job_id}`
+   - `POST /chat/jobs` starts background execution and returns a polling snapshot immediately.
+   - `GET /chat/jobs/{job_id}` returns latest snapshot for frontend polling.
+
+### Contract Notes for Frontend
+
+- `POST /chat/jobs` accepts the same body/query fields as `/chat/stream`.
+- Response includes:
+  - `job_id`
+  - `status`
+  - `session_id`
+  - `turn_id`
+  - `chat_id`
+  - `latest_text`
+  - `latest_reasoning_text`
+  - `latest_command`
+  - `stream_events`
+  - `final_reply`
+  - `timing`
+  - `usage`
+  - `runtime_vendor`
+  - `runtime_binary`
+  - `error`
+- `GET /chat/jobs/{job_id}` returns the same snapshot shape.
+
+### Persistence/Reproducibility Semantics Preserved
+
+- Final turn persistence is still handled by the same chat execution path.
+- Session/turn history endpoints (`/chat/sessions`, `/chat/sessions/{session_id}/turns`) remain the source of truth for historical replay.
+- Job registry stores transient in-flight state only; it is not used as durable chat history.
+
+### Current Scope Boundary
+
+- Backend-only Phase 1 is implemented here.
+- No frontend changes are included in this update.
+- `DELETE /chat/jobs/{job_id}` is not implemented yet.
