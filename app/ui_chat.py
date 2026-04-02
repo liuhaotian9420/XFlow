@@ -292,7 +292,7 @@ def _render_result_block(result: dict[str, Any], task_id: str, key_suffix: str) 
         for idx, item in enumerate(follow):
             label = item[:80] + ("..." if len(item) > 80 else "")
             if st.button(label, key=f"fu_{key_suffix}_{idx}"):
-                st.session_state["_followup_q"] = item
+                st.session_state["_followup_q"] = {"text": item, "mode": "chat"}
                 st.rerun()
 
 
