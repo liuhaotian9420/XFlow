@@ -27,6 +27,7 @@ It owns:
 2. metric and grain selection
 3. source-table and join-path selection from local references
 4. SQL generation in a format that downstream execution skills can consume directly
+5. metadata-enrichment handoff when a required table is missing from the local table reference but can be verified in ODPS
 
 It does **not** own:
 
@@ -35,6 +36,7 @@ It does **not** own:
 - DuckDB persistence
 - multi-file SQL orchestration
 - post-execution validation against live ODPS data
+- direct implementation of table-metadata sync logic itself
 
 The core value of this skill is not generic SQL writing. The core value is choosing the correct business context first, then producing SQL that is usable without manual restructuring.
 
@@ -141,6 +143,8 @@ This skill is allowed to use:
 - `references/relations.md`
 - `references/sql代码/`
 
+- `.agents/skills/dataworks/SKILL.md`
+
 ## Outputs
 
 ### Required output contract
@@ -224,6 +228,7 @@ This skill succeeds only if:
 - partition/date logic is present where needed
 - the output can be saved as one `.sql` file
 - the output is usable by `dataworks` without manual cleanup
+- any required table missing from `references/tables.md` but verified as real is handed off to `sql-export-agent` for metadata sync before finalizing when feasible
 
 ## Failure behavior
 
@@ -236,6 +241,7 @@ Expected failure classes:
 - missing date scope when date logic materially changes the SQL
 - no credible source tables found in local references
 - request implicitly needs multiple scripts instead of one
+- required table is missing from local references and cannot be verified as a real ODPS table
 
 When failing:
 
@@ -402,6 +408,38 @@ Use references in this order:
 6. `references/sql代码/`
    - borrow stable query shapes, filters, labels, and date logic
 
+7. `.agents/skills/dataworks/SKILL.md`
+   - only when a required table is missing from `references/tables.md` and needs metadata sync guidance
+
+## Missing-table enrichment rule
+
+When source-table selection reveals a required table name, apply this rule before finalizing:
+
+1. check whether the table already has a section in `references/tables.md`
+2. if it is already documented, continue normally
+3. if it is not documented, verify whether the table is real and fetchable in ODPS
+4. if it is real, immediately use `sql-export-agent` at `.agents/skills/dataworks/SKILL.md` to sync the table into `.agents/skills/dataworks/references/tables.md`
+5. read the synced metadata and use it to tighten field selection, partition logic, and join assumptions
+6. if the table cannot be verified as real, do not fabricate fields; surface it as a blocker or explicit assumption
+
+Treat this as a metadata-enrichment handoff only. `sql-generator` still owns business interpretation and final SQL composition.
+
+## Handoff contract to sql-export-agent
+
+When invoking `sql-export-agent` for a missing table, pass the narrowest request possible:
+
+- the exact table name, in `project.table` or fully qualified form
+- the target markdown path `.agents/skills/dataworks/references/tables.md`
+- whether DDL or sample rows may be skipped if speed or permissions require it
+
+Expected result from the handoff:
+
+- one upserted table section in `.agents/skills/dataworks/references/tables.md`
+- field names and data types sufficient for SQL generation
+- optional DDL and sample rows when live access allows them
+
+If `sql-export-agent` fails because the table cannot be fetched, treat that as failed verification and say so explicitly in the assumptions or blocker note.
+
 ## SQL generation rules
 
 When generating SQL:
@@ -433,18 +471,18 @@ If the request naturally expands into multiple SQL scripts, the skill should:
 
 ## Dependency boundary
 
-This skill is intentionally offline and reference-driven.
+This skill is reference-driven by default and only uses live metadata lookup through `sql-export-agent` when a required table is missing from local references.
 
 It depends on:
 
 - local markdown references
 - local SQL examples
 - local extracted table and relation context
+- optional `sql-export-agent` handoff for missing-table verification and metadata sync
 
 It does **not** depend on:
 
 - ODPS credentials
-- live database access
 - network access
 - file execution privileges
 
@@ -461,6 +499,7 @@ Before returning the result, verify:
 - output mode is stated
 - placeholders are listed
 - assumptions are short and concrete
+- any required missing-but-real table has been sent through the metadata sync workflow before the SQL is finalized
 
 ## Failure modes to surface clearly
 
