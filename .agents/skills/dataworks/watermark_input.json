@@ -1,0 +1,14 @@
+{
+  "skill": "sql-export-agent",
+  "version": "v1",
+  "input_files": [
+    "artifacts/order_fee_complaint_sample_5000_20251101.sql",
+    "artifacts/scorecard_fee_kesu_is_zq_20260403_5000/excel/order_fee_complaint_sample_5000_20251101.xlsx",
+    "artifacts/scorecard_fee_kesu_is_zq_20260403_5000/order_fee_complaint_sample.duckdb"
+  ],
+  "actions": [
+    "executed ODPS SQL for 5000-row fee complaint order sample",
+    "exported query result to Excel",
+    "cached query result into DuckDB table order_fee_complaint_sample_5000"
+  ]
+}

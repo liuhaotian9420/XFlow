@@ -1,0 +1,13 @@
+{
+  "skill": "sql-generator",
+  "version": "v1",
+  "input_files": [
+    ".agents/skills/sql-generator/SKILL.md",
+    "artifacts/order_fee_complaint_sample_5000_20251101.sql"
+  ],
+  "actions": [
+    "generated order_fee_complaint_sample_5000_20251101.sql",
+    "joined dws_inloan_user_order_df with kesu_users, customer features, portfolio labels, and b-card model",
+    "applied first_order_time >= 2025-11-01 filter and 5000-row sample limit"
+  ]
+}

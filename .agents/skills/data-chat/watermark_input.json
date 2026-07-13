@@ -1,0 +1,15 @@
+{
+  "skill": "data-chat",
+  "version": "v1",
+  "input_files": [
+    ".agents/skills/data-chat/SKILL.md",
+    "artifacts/order_fee_complaint_sample_5000_20251101.sql",
+    "artifacts/scorecard_fee_kesu_is_zq_20260403_5000/excel/order_fee_complaint_sample_5000_20251101.xlsx",
+    "artifacts/scorecard_fee_kesu_is_zq_20260403_5000/scorecardpy/run_summary.json"
+  ],
+  "actions": [
+    "used data-chat to coordinate SQL generation, ODPS export, and scorecard analysis",
+    "summarized 5000-row fee complaint order sample and 361-row dev sample for is_zq analysis",
+    "prepared concise findings on top differentiating fields for is_zq"
+  ]
+}

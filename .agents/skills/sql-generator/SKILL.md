@@ -447,11 +447,28 @@ When generating SQL:
 - prefer ODPS-style SQL used in the local corpus
 - preserve local naming and result-shape conventions where possible
 - use explicit partitions or date filters when the table appears partitioned
+- if a source table has a `pt` field or is documented as partitioned, push a correct `pt` predicate into that table access path rather than leaving the partition unconstrained
 - use `MAX_PT(...)` only when it fits the referenced table pattern
 - keep result grain explicit
+- minimize the number of joined tables; do not add a join unless it contributes a required metric, dimension, filter, or deduplication step
+- push filters down as early as possible; prefer filtering in the base subquery or CTE before the join and aggregation stages
 - avoid inventing business labels not supported by the corpus or user request
 - do not silently switch business口径
 - prefer the simplest runnable script that meets the request
+
+## SQL best practices
+
+Apply these defaults unless a stronger business requirement or reference pattern overrides them:
+
+1. partition-first access
+   - when a table has `pt`, every scan of that table should carry an explicit `where pt ...` constraint or an equivalent partition predicate
+   - avoid full-table scans caused by joining or aggregating before partition filtering
+2. join minimization
+   - start from the narrowest table set that can answer the question
+   - prefer one reliable fact table plus the minimum necessary dimension lookups over wide multi-join constructions
+3. early filtering
+   - filter date windows, product scope, channel scope, user scope, and status flags inside the earliest valid CTE or subquery
+   - aggregate after early filtering unless the business logic explicitly requires the reverse order
 
 ## Downstream compatibility rules
 
@@ -496,6 +513,9 @@ Before returning the result, verify:
 - table names are plausible in local references
 - joins are explicit
 - date or partition logic is not missing
+- every partitioned source table has an explicit and credible `pt` filter when applicable
+- filters are pushed into the earliest safe CTE or subquery rather than deferred to the outermost query
+- joins are not broader than necessary for the requested metrics and dimensions
 - output mode is stated
 - placeholders are listed
 - assumptions are short and concrete

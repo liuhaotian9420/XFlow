@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 _fix_comments.py \"xyf_fengkong_dev.wzq_order_b5_b4_compare_base.md\" \"xyf_bi.wzq_order_table.md\")",
+      "Bash(where python:*)",
+      "Bash(uv run:*)"
+    ]
+  }
+}

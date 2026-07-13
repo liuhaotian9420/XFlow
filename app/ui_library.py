@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -114,9 +115,93 @@ def _show_sync_gitlab_dialog() -> None:
     st.caption("GitLab 同步入口已预留，后续会在这里接入实际同步流程。")
 
 
+@st.dialog("导入本地 SKILL")
+def _show_import_skill_dialog() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    template_content = """---
+name: example-skill
+description: Briefly describe what this skill does and when it should be used.
+---
+
+## Purpose
+
+Describe the goal of the skill and the problem it solves.
+
+## When to use
+
+- Explain the trigger conditions.
+- Mention the typical user request patterns.
+
+## Inputs
+
+- List required files, parameters, or assumptions.
+
+## Workflow
+
+1. Step one.
+2. Step two.
+3. Step three.
+
+## Outputs
+
+- Describe expected outputs or artifacts.
+"""
+    st.download_button(
+        "下载 SKILL 模板",
+        data=template_content.encode("utf-8"),
+        file_name="SKILL.md",
+        mime="text/markdown",
+        key="download_skill_template",
+        use_container_width=True,
+    )
+    uploaded = st.file_uploader("选择一个本地 `SKILL.md` 文件", type=["md"], key="import_skill_file")
+    skill_name = st.text_input(
+        "技能名称",
+        key="import_skill_name",
+        placeholder="例如：customer-segmentation",
+        help="将写入到 `.agents/skills/<技能名称>/SKILL.md`。",
+    )
+
+    if st.button("开始导入", key="import_skill_submit", use_container_width=True, type="primary"):
+        if uploaded is None:
+            st.error("请先选择一个 `SKILL.md` 文件。")
+            return
+        if uploaded.name != "SKILL.md":
+            st.error("文件名必须严格为 `SKILL.md`。")
+            return
+        normalized_name = _normalize_skill_directory_name(skill_name)
+        if not normalized_name:
+            st.error("技能名称不能为空，且只允许字母、数字、空格、`-`、`_`。")
+            return
+        try:
+            content = uploaded.getvalue().decode("utf-8")
+        except UnicodeDecodeError:
+            st.error("文件必须使用 UTF-8 编码。")
+            return
+        validation_error = _validate_imported_skill_markdown(content)
+        if validation_error:
+            st.error(validation_error)
+            return
+
+        target_dir = repo_root / ".agents" / "skills" / normalized_name
+        target_file = target_dir / "SKILL.md"
+        if target_file.exists():
+            st.error(f"目标目录已存在：`{target_dir.name}`。请更换技能名称。")
+            return
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_file.write_text(content, encoding="utf-8")
+        _cached_skill_items.clear()
+        st.session_state["skills_import_notice"] = f"已导入到 `.agents/skills/{normalized_name}/SKILL.md`"
+        st.rerun()
+
+
 def render_skills_tab() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     skill_items = _cached_skill_items(str(repo_root))
+    import_notice = str(st.session_state.pop("skills_import_notice", "") or "").strip()
+    if import_notice:
+        st.success(import_notice)
 
     hero_col, action_col = st.columns([10, 0.1], gap="small", vertical_alignment="center")
     with hero_col:
@@ -144,7 +229,7 @@ def render_artifacts_tab() -> None:
     st.markdown(
         """
         <div class="xyf-library-hero">
-            <div class="xyf-library-kicker">工作区文件</div>
+            <div class="xyf-library-kicker">Workspace</div>
             <div class="xyf-library-title">分析产出</div>
             <div class="xyf-library-copy">
                 以紧凑文件视图检索、筛选并查看历史任务沉淀下来的可复用产出。
@@ -222,7 +307,7 @@ def render_topics_tab() -> None:
     st.markdown(
         """
             <div class="xyf-library-hero xyf-topic-hero">
-            <div class="xyf-library-kicker">专题看板</div>
+            <div class="xyf-library-kicker">Tracker</div>
             <div class="xyf-library-title">专题追踪</div>
             <div class="xyf-library-copy">
                 基于 artifacts 目录中的专题文件夹追踪分析主题、产出沉淀和最新活动，快速定位当前在跑什么、积累了什么。
@@ -551,7 +636,7 @@ def _render_skill_section(items: list[SkillGalleryItem]) -> None:
         st.info("`.agents/skills` 下还没有本地技能。")
         return
 
-    search_col, category_col,pagination_col,action_col = st.columns([1.2, 1, 0.6, 0.2], gap="small",vertical_alignment = 'bottom')
+    search_col, category_col,pagination_col,action_col = st.columns([0.75, 0.3, 0.45, 0.6], gap="small",vertical_alignment = 'bottom')
     with search_col:
         search = st.text_input("搜索技能", key="skills_search_query", placeholder="planner、sql、verification...")
     with category_col:
@@ -579,17 +664,14 @@ def _render_skill_section(items: list[SkillGalleryItem]) -> None:
             st.info("当前页没有技能。")
             return
     with action_col:
-        if st.button("远程同步", key="skills_sync_gitlab", width = 'content', type="primary"):
-            _show_sync_gitlab_dialog()
-    # st.markdown(
-    #     """
-    #     <div class="xyf-library-hero">
-    #         <div class="xyf-library-kicker">Filtered results</div>
-    #         <div class="xyf-library-title">Skills</div>
-    #     </div>
-    #     """,
-    #     unsafe_allow_html=True,
-    # )
+        import_col, sync_col = st.columns(2, gap="small")
+        with import_col:
+            if st.button("从本地导入", key="skills_import_local", type="secondary",width = 'stretch',help='上传本地的 SKILL 文件'):
+                _show_import_skill_dialog()
+        with sync_col:
+            if st.button("同步远程", key="skills_sync_gitlab", type="primary",width = 'stretch',help='同步远程的 SKILL 文件'):
+                _show_sync_gitlab_dialog()
+
     cols = st.columns(2)
     for idx, item in enumerate(paged_skills):
         with cols[idx % 2]:
@@ -624,7 +706,7 @@ def _render_business_theme_section(items: list[BusinessThemeItem]) -> None:
         st.info("`knowledge_base/theme` 下还没有业务主题文档。")
         return
 
-    search_col, category_col, pagination_col = st.columns([1.15, 1, 0.72], gap="small", vertical_alignment="bottom")
+    search_col, category_col, pagination_col = st.columns([0.75, 0.25, 0.72], gap="small", vertical_alignment="bottom")
     with search_col:
         search = st.text_input("搜索主题", key="business_theme_search_query", placeholder="新客、老客、监控、复盘...")
     with category_col:
@@ -685,7 +767,7 @@ def _render_business_table_section(items: list[BusinessTableItem]) -> None:
         st.info("`knowledge_base/dataworks/tables.md` 中还没有可展示的 DataWorks 表知识。")
         return
 
-    search_col, schema_col, detail_col, pagination_col = st.columns([1.2, 0.8, 0.8, 0.72], gap="small", vertical_alignment="bottom")
+    search_col, schema_col, detail_col, pagination_col = st.columns([1, 0.48, 0.68, 0.92], gap="small", vertical_alignment="bottom")
     with search_col:
         search = st.text_input("搜索表", key="business_table_search_query", placeholder="dws_inloan、risk、customer...")
     with schema_col:
@@ -1283,6 +1365,28 @@ def _truncate_text(text: str, limit: int) -> str:
     return text[: max(0, limit - 3)].rstrip() + "..."
 
 
+def _normalize_skill_directory_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9 _-]+", "", (name or "").strip())
+    cleaned = re.sub(r"[\s_]+", "-", cleaned).strip("-").lower()
+    return cleaned
+
+
+def _validate_imported_skill_markdown(content: str) -> str | None:
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return "SKILL.md 必须以 YAML frontmatter 开头。"
+    name, description = _parse_skill_front_matter(lines)
+    if not name:
+        return "frontmatter 缺少 `name` 字段。"
+    if not description:
+        return "frontmatter 缺少 `description` 字段。"
+    required_sections = ("## Purpose",)
+    for section in required_sections:
+        if section not in content:
+            return f"缺少必需章节：`{section}`。"
+    return None
+
+
 def _paginate_items[T](items: list[T], *, key_prefix: str, page_size: int, display_total = True) -> list[T]:
     total_pages = max(1, (len(items) + page_size - 1) // page_size)
     page_key = f"{key_prefix}_page"
@@ -1290,7 +1394,7 @@ def _paginate_items[T](items: list[T], *, key_prefix: str, page_size: int, displ
     current_page = min(max(1, current_page), total_pages)
     st.session_state[page_key] = current_page
 
-    p1, p2, p3 = st.columns([1, 2, 1], gap="small")
+    p1, p2, p3 = st.columns([1, 1.5, 1], gap="small")
     with p1:
         if st.button("上一页", key=f"{key_prefix}_prev", disabled=current_page <= 1, use_container_width=True):
             st.session_state[page_key] = current_page - 1

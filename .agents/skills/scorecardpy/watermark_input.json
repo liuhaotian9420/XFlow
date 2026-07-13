@@ -1,0 +1,14 @@
+{
+  "skill": "scorecardpy-duckdb-large-scale-scorecard",
+  "version": "v1",
+  "input_files": [
+    "artifacts/scorecard_fee_kesu_is_zq_20260403_5000/order_fee_complaint_sample.duckdb",
+    "artifacts/scorecard_fee_kesu_is_zq_20260403_5000/scorecardpy/bins.pkl",
+    "artifacts/scorecard_fee_kesu_is_zq_20260403_5000/x_cols.json"
+  ],
+  "actions": [
+    "built 361-row dev sample with all positives and downsampled negatives",
+    "ran scorecardpy woebin on selected business features only",
+    "saved plots, selected variables, breaks export, and variable strength summary"
+  ]
+}

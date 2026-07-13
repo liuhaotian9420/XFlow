@@ -9,6 +9,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 _BRAND_LOGO_PATH = _REPO_ROOT / "xflow.png"
+_MAIN_TABS_KEY = "main_tabs"
+_CHAT_TAB_LABEL = "AI助手"
 
 from app.chat_actions import _enqueue_chat, _enqueue_review_respond, _enqueue_task
 from app.streamlit_state import (
@@ -51,8 +53,12 @@ _init_state()
 render_sidebar()
 
 tab_chat, tab_skills, tab_artifacts, bussiness_theme, topics = st.tabs(
-    ["AI助手", "技能库", "分析产出", "业务知识库", "专题追踪"]
+    [_CHAT_TAB_LABEL, "技能库", "分析产出", "业务知识库", "专题追踪"],
+    key=_MAIN_TABS_KEY,
+    on_change="rerun",
 )
+tab_state = st.session_state.get(_MAIN_TABS_KEY, _CHAT_TAB_LABEL)
+is_chat_tab_active = tab_state == _CHAT_TAB_LABEL or tab_state == 0
 
 with tab_chat:
     if st.session_state.get("_followup_q"):
@@ -109,6 +115,26 @@ with tab_chat:
 
     for idx in range(cut, len(messages)):
         render_chat_message(idx, messages[idx])
+    st.markdown('<div id="chat-end-anchor"></div>', unsafe_allow_html=True)
+
+    prev_is_chat_tab_active = bool(st.session_state.get("_prev_is_chat_tab_active", is_chat_tab_active))
+    prev_chat_message_count = int(st.session_state.get("_prev_chat_message_count", len(messages)))
+    should_scroll_to_bottom = (
+        (is_chat_tab_active and not prev_is_chat_tab_active)
+        or (is_chat_tab_active and len(messages) > prev_chat_message_count)
+    )
+    if should_scroll_to_bottom:
+        st.html(
+            """
+            <script>
+            const anchor = window.parent.document.getElementById("chat-end-anchor");
+            if (anchor) {
+              anchor.scrollIntoView({ behavior: "smooth", block: "end" });
+            }
+            </script>
+            """,
+            unsafe_allow_javascript=True,
+        )
 
     draft_text = str(st.session_state.get("chat_composer_draft_value") or "")
     if draft_text.strip():
@@ -206,3 +232,5 @@ with bussiness_theme:
 with topics:
     render_topics_tab()
 
+st.session_state["_prev_is_chat_tab_active"] = bool(is_chat_tab_active)
+st.session_state["_prev_chat_message_count"] = int(len(st.session_state.get("messages") or []))
