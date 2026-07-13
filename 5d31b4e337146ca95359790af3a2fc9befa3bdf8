@@ -1,0 +1,126 @@
+knowledge_base/dataworks/by_table/xyf_ads.ads_user_market_portfolio_label_df.md
+  81df809e1389f8c5 1-136
+knowledge_base/dataworks/by_table/xyf_ads.bi_ts_gd_wide_table_v3.md
+  81df809e1389f8c5 1-535
+knowledge_base/dataworks/by_table/xyf_dwd.dwd_user_vip_order_df.md
+  81df809e1389f8c5 1-162
+knowledge_base/dataworks/by_table/xyf_jingying_dev.lss_ewfk_first_loan_info.md
+  81df809e1389f8c5 1-84
+knowledge_base/dataworks/by_table/xyf_fengkong_dev.hhn_fk_ord_flg_all.md
+  81df809e1389f8c5 1-64
+knowledge_base/dataworks/tables.md
+  81df809e1389f8c5 1-189
+knowledge_base/dataworks/by_table/xyf_bi_dev.api_app_2_ord_v1120.md
+  81df809e1389f8c5 1-48
+knowledge_base/theme/business_overview.md
+  81df809e1389f8c5 1-83
+knowledge_base/theme/business_requirements_patterns.md
+  81df809e1389f8c5 1-91
+knowledge_base/dataworks/by_table/xyf_ads.ads_feature_custno_app_customer_df.md
+  81df809e1389f8c5 1-294
+.agents/skills/scorecardpy/watermark_input.json
+  81df809e1389f8c5 1-14
+.agents/skills/sql-generator/watermark_input.json
+  81df809e1389f8c5 1-13
+knowledge_base/theme/business_theme_monitoring.md
+  81df809e1389f8c5 1-60
+knowledge_base/dataworks/by_table/xyf_ads.ads_fin_onloan_fee_df.md
+  81df809e1389f8c5 1-76
+knowledge_base/dataworks/by_table/xyf_dim.dim_pub_date.md
+  81df809e1389f8c5 1-160
+knowledge_base/dataworks/by_table/xyf_dwd.dwd_inloan_loan_apply_main_df.md
+  81df809e1389f8c5 1-153
+knowledge_base/dataworks/by_table/xyf_dws.dws_inloan_loan_risk_stat_df.md
+  81df809e1389f8c5 1-50
+knowledge_base/dataworks/by_table/xyf_dws.dws_inloan_user_order_df.md
+  81df809e1389f8c5 1-133
+app/ui_library.py
+  81df809e1389f8c5 5,118-198,202-204,232,310,639,667-674,709,770,1368-1389,1397
+.agents/skills/dataworks/watermark_input.json
+  81df809e1389f8c5 1-14
+knowledge_base/dataworks/by_table/xyf_bi.fk_risk_order_feature_df_forbi.md
+  81df809e1389f8c5 1-532
+.gitignore
+  81df809e1389f8c5 38
+knowledge_base/dataworks/table-metadata.md
+  81df809e1389f8c5 1-80
+.agents/skills/data-chat/watermark_input.json
+  81df809e1389f8c5 1-15
+knowledge_base/dataworks/by_table/xyf_dwd.dwd_risk_model_b_card_df.md
+  81df809e1389f8c5 1-59
+knowledge_base/dataworks/by_table/xyf_dws.dws_inloan_user_order_hf_v.md
+  81df809e1389f8c5 1-239
+knowledge_base/dataworks/by_table/xyf_fengkong_dev.zsh_vip_fk_ord_flg.md
+  81df809e1389f8c5 1-46
+knowledge_base/dataworks/by_table/xyf_jingying.weekly_analysis_report_df_lss.md
+  81df809e1389f8c5 1-112
+knowledge_base/theme/business_theme_new_customer.md
+  81df809e1389f8c5 1-56
+knowledge_base/dataworks/by_table/xyf_dwd.dwd_user_tek_order_df.md
+  81df809e1389f8c5 1-105
+knowledge_base/dataworks/by_table/xyf_dws.dws_inloan_loan_channel_stat_df.md
+  81df809e1389f8c5 1-220
+knowledge_base/dataworks/by_table/xyf_fengkong_dev.zsh_tek_fk_ord_flg.md
+  81df809e1389f8c5 1-60
+knowledge_base/dataworks/by_table/xyf_dwd.dwd_preloan_credit_apply_df.md
+  81df809e1389f8c5 1-138
+knowledge_base/theme/business_theme_existing_customer.md
+  81df809e1389f8c5 1-53
+knowledge_base/dataworks/by_table/xyf_dwd.dwd_inloan_leap_vip_order_hf.md
+  81df809e1389f8c5 1-220
+knowledge_base/dataworks/by_table/xyf_bi.wzq_order_table.md
+  81df809e1389f8c5 1-676
+app/streamlit_app.py
+  81df809e1389f8c5 12-13,56-58,60-61,118-137,235-236
+knowledge_base/dataworks/by_table/xyf_fengkong_dev.scq_fy_history_risk_price_modify.md
+  81df809e1389f8c5 1-40
+.agents/skills/sql-generator/SKILL.md
+  81df809e1389f8c5 450,453-454,459-472,516-518
+knowledge_base/dataworks/by_table/xyf_ads.ads_fin_clear_loan_df_02_00.md
+  81df809e1389f8c5 1-116
+knowledge_base/dataworks/by_table/index.md
+  81df809e1389f8c5 1-39
+knowledge_base/dataworks/by_table/xyf_dws.dws_inloan_loan_pass_stat_df.md
+  81df809e1389f8c5 1-67
+knowledge_base/dataworks/by_table/xyf_bi_dev.amt_predict_oct24_v2.md
+  81df809e1389f8c5 1-47
+knowledge_base/dataworks/by_table/xyf_dws.dws_inloan_loan_channel_stat_df_04.md
+  81df809e1389f8c5 1-121
+knowledge_base/dataworks/by_table/xyf_dwd.dwd_repay_loan_repay_plan_df.md
+  81df809e1389f8c5 1-191
+knowledge_base/dataworks/by_table/xyf_dws.dws_repay_risk_order_bill_mob_df.md
+  81df809e1389f8c5 1-644
+knowledge_base/dataworks/by_table/xyf_bi_dev.kesu_users.md
+  81df809e1389f8c5 1-52
+.claude/settings.local.json
+  81df809e1389f8c5 1-9
+knowledge_base/dataworks/by_table/xyf_ads.ads_inloan_loan_monitor_screen_df.md
+  81df809e1389f8c5 1-54
+knowledge_base/dataworks/by_table/xyf_ads.ads_inloan_loan_balance_mthly_df_01.md
+  81df809e1389f8c5 1-44
+knowledge_base/dataworks/by_table/xyf_dws.dws_repay_user_order_df.md
+  81df809e1389f8c5 1-108
+knowledge_base/dataworks/by_table/xyf_fengkong_dev.wzq_order_b5_b4_compare_base.md
+  81df809e1389f8c5 1-830
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0-codex",
+  "base_commit_sha": "5d31b4e337146ca95359790af3a2fc9befa3bdf8",
+  "prompts": {
+    "81df809e1389f8c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f595a-98d5-7072-b7a6-ca80ce811f01",
+        "model": "gpt-5.5"
+      },
+      "human_author": "haotianliu",
+      "messages": [],
+      "total_additions": 7503,
+      "total_deletions": 18,
+      "accepted_lines": 8834,
+      "overriden_lines": 0,
+      "messages_url": "https://codeaiapi.xinfei-inc.cn/cas/b5e0c1332eb0ec40e9a73f5cb4b8da065e30b885ecd4d9c7dfb1f5914ce60860"
+    }
+  }
+}
