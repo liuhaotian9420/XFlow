@@ -1,0 +1,26 @@
+docs/analysis-agent-architecture.zh-CN.md
+  0acbc2c9a132076e 1-705
+docs/architecture.zh-CN.md
+  0acbc2c9a132076e 5-6,56-80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0-codex",
+  "base_commit_sha": "00089d86085b4cc3e44667e068077132afef0847",
+  "prompts": {
+    "0acbc2c9a132076e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f699b-a188-7dc1-98a4-89fbf83387b0",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "haotianliu",
+      "messages": [],
+      "total_additions": 1536,
+      "total_deletions": 3,
+      "accepted_lines": 1533,
+      "overriden_lines": 0,
+      "messages_url": "https://codeaiapi.xinfei-inc.cn/cas/5a4f1ed96595985401faf8e82e22263ae43bd60f37714bf33969f7a0d95bd618"
+    }
+  }
+}
