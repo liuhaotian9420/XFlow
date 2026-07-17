@@ -433,6 +433,273 @@ unverified
 - 高风险知识审核
 
 具体任务中的 Warrant 由 Agent 自主组合和维护，验证后可以选择沉淀到长期知识库。
+
+### 6.6 Warrant 生产协议
+
+Warrant 的生产不是“从结论反向补一个听起来合理的理由”，而是把当前任务中的**待验证推理关系**显式建模。它的输入至少包括：
+
+```text
+Analysis Spec
++ Prior Belief
++ Schema / Metric Semantics
++ Domain Context
++ 已知方法约束
+```
+
+生产过程分为五步。
+
+#### Step 1：界定推理缺口
+
+Analyst 先识别当前已知内容与目标分析输出之间缺少哪一种推理关系，而不是直接生成最终结论。
+
+```text
+已知：某指标下降
+目标：解释下降来自哪里，以及可以采取什么行动
+推理缺口：指标变化如何由结构、组内表现、样本选择或口径变化产生
+```
+
+这里产出的是 `reasoning_gap`，不是 Warrant 本身。它用于限定候选 Warrant 的问题域。
+
+#### Step 2：生成 Candidate Warrant Space
+
+Analyst 基于 `reasoning_gap`、Schema 和 Domain Context 生成多个竞争或互补的 Candidate Warrant。Domain Agent 负责补充领域机制、排除语义上不成立的候选；Critic 负责检查候选是否只是 Claim 或目标 Inference 的同义改写。
+
+每个 Candidate Warrant 至少使用以下结构：
+
+```yaml
+warrant_id: W-001
+statement: 渠道占比变化可以导致总体转化率变化
+scope:
+  population: 当前分析人群
+  metrics: [overall_conversion, channel_conversion]
+  time_range: 当前分析周期
+assumptions:
+  - 渠道定义在比较周期内一致
+  - 各渠道转化率可比
+predictions:
+  - 渠道占比发生显著变化
+  - 固定渠道转化率后，总体转化率仍会随渠道结构变化
+disconfirming_conditions:
+  - 渠道占比稳定
+  - 标准化渠道结构后变化幅度不下降
+required_evidence:
+  - 分周期渠道占比
+  - 分周期渠道内转化率
+  - 结构标准化或分解结果
+provenance:
+  source: task_generated
+  generated_by: analyst_agent
+  based_on: [analysis_spec, schema_profile, domain_context]
+status: proposed
+```
+
+`statement` 表达可复用的推理关系；`scope` 和 `assumptions` 限定它在哪些条件下成立；`predictions` 与 `disconfirming_conditions` 让它可被观察结果支持或削弱；`required_evidence` 则连接推理层和工具执行层。
+
+#### Step 3：编译为 Evidence Requirements
+
+Warrant 不能直接交给 SQL、Python 或其他工具执行。Analyst 需要把它编译成明确、可执行、可审计的 Evidence Requirements：
+
+```text
+Warrant
+  -> 需要观察什么变量
+  -> 需要什么比较或识别设计
+  -> 需要控制哪些口径和混杂因素
+  -> 哪种结果支持 / 削弱 / 无法区分该 Warrant
+  -> 对应的 SQL / pandas / DuckDB / statistical action
+```
+
+Evidence Requirement 至少包含：
+
+- 数据对象、字段、指标定义和粒度
+- 样本范围、时间范围和对照范围
+- 所需变换、分解、检验或模型
+- 数据质量与方法前提
+- 预期结果模式和判定规则
+- 可支持或区分的 Warrant ID
+
+这一步的关键产物不是“分析计划看起来完整”，而是建立可追踪映射：
+
+```text
+Evidence Action -> Evidence -> Candidate Warrant
+```
+
+#### Step 4：选择最有区分度的 Evidence Action
+
+Critic 不以“信息量最多”作为唯一目标，而是优先选择能最大程度改变 Candidate Warrant Space 的动作。可以使用以下启发式：
+
+```text
+priority(action)
+  = expected_discrimination
+  * decision_relevance
+  * evidence_reliability
+  / execution_cost
+```
+
+一个好的 Evidence Action 应尽量满足：
+
+- 不同候选 Warrant 对结果有不同预测
+- 结果可以明确支持、削弱或排除至少一个候选
+- 计算和方法可以被确定性工具复现
+- 成本与当前结论风险相匹配
+
+如果多个 Warrant 对现有数据给出相同预测，系统应输出“当前证据无法区分”，而不是任意选择一个解释。
+
+#### Step 5：形成 Claims，再更新 Warrant
+
+工具结果首先被表达为 Atomic Claims，再用于更新 Warrant。不能把原始表格或模型输出直接视为 Warrant 已成立。
+
+```text
+Tool Result
+  -> Evidence
+  -> Atomic Claim
+  -> Warrant Update
+  -> Inference
+```
+
+例如：
+
+```text
+Evidence：渠道 A 占比从 20% 上升到 40%，渠道内转化率基本稳定
+Claim：观察期内渠道结构发生变化，且组内表现变化较小
+Warrant Update：支持“结构变化影响总体指标”，削弱“渠道内表现恶化”
+Inference：总体转化率变化主要与渠道结构变化一致
+```
+
+这里的 Inference 强度仍受识别设计限制。“与……一致”“主要由……解释”和“由……导致”必须对应不同强度的 Warrant 与 Evidence。
+
+### 6.7 Warrant 维护协议
+
+Warrant Ledger 保存的不是一组不可变规则，而是 Candidate Warrant 在任务中的状态、证据引用、适用范围和版本历史。
+
+#### 6.7.1 Ledger 操作
+
+最小实现应支持以下操作：
+
+| 操作 | 含义 | 典型触发条件 |
+| --- | --- | --- |
+| `propose` | 创建新的候选 Warrant | 出现新的推理缺口或解释候选 |
+| `instantiate` | 将通用 Warrant 绑定到当前指标、人群和时间范围 | 从长期知识库检索到可复用模板 |
+| `support` | 增加支持证据并提高置信状态 | 预测被独立 Evidence 命中 |
+| `weaken` | 降低支持程度，但暂不排除 | 预测仅部分成立或出现相反 Evidence |
+| `specialize` | 收窄适用范围或补充假设 | 只在特定人群、周期或口径下成立 |
+| `split` | 将过宽 Warrant 拆成多个可区分子 Warrant | 不同机制被同一个 statement 混合表达 |
+| `reject` | 在当前任务中排除 | 关键预测被反证或前提不成立 |
+| `promote` | 晋升为可跨任务复用的 Warrant | 多任务验证、领域审阅和来源完整 |
+
+状态更新不能只保存一个最终标签。每次操作都应生成新版本并保留：
+
+```yaml
+version: 3
+operation: specialize
+previous_version: 2
+evidence_refs: [E-007, E-009]
+claim_refs: [C-004]
+changed_fields: [scope.population, assumptions]
+rationale: 该关系仅在新客样本中得到支持
+actor: critic_agent
+reviewers: [domain_agent]
+created_at: 2026-07-17T00:00:00Z
+```
+
+因此，Warrant 的“置信”不是脱离语境的单一概率，而是以下信息的组合：
+
+- 当前状态：`proposed / supported / weakened / rejected / inconclusive`
+- 支持与反对 Evidence 的数量、质量和独立性
+- 仍然成立的 assumptions
+- 已验证的 scope
+- 发现证据与验证证据是否分离
+- Domain / Critic / Human 的审阅记录
+
+#### 6.7.2 Task-local 与 Promoted Warrant
+
+系统应明确区分两层 Warrant：
+
+**Task-local Warrant**
+
+- 由当前任务自主生成或实例化
+- 默认只在当前 Analysis Spec、数据范围和假设下有效
+- 可以快速 `propose / weaken / split / reject`
+- 不自动污染长期知识库
+
+**Promoted Warrant**
+
+- 来自多个任务中重复出现且被独立验证的关系
+- 具有稳定的领域定义、适用范围、反例和版本记录
+- 经过 Domain Agent、Critic 或 Human 的晋升审阅
+- 作为下一任务的候选模板，而不是不可质疑的事实
+
+推荐的晋升门槛是：
+
+```text
+多任务复现
++ 独立 Validation Evidence
++ 明确 Scope 与 Assumptions
++ 已知反例 / Disconfirming Conditions
++ 完整 Provenance
++ Domain / Human Review（高风险场景必需）
+```
+
+Promoted Warrant 被新任务使用时，必须先执行 `instantiate`，重新绑定当前语境并验证 assumptions，不能直接继承历史支持状态。
+
+#### 6.7.3 各 Agent 的维护职责
+
+| 角色 | Warrant 相关职责 |
+| --- | --- |
+| Analyst Agent | 识别 reasoning gap、生成候选、编译 Evidence Requirements、形成 Claim 和初步 Inference |
+| Domain Agent | 提供领域机制和边界、校验指标语义与 assumptions、审查 specialize / promote |
+| Critic Agent | 去除循环论证、选择区分性动作、审计 Evidence、执行 Ledger 状态变更 |
+| Human | 审核高风险 Inference、处理无法形式化的价值判断、维护长期 Promoted Warrant |
+
+同一个模型可以在 MVP 中依次扮演 Analyst 和 Critic，但必须使用分离的上下文、结构化产物和审计步骤，避免同一次生成同时提出 Warrant 又宣布其成立。
+
+### 6.8 Warrant 驱动的 Agent Loop 与 Done
+
+Warrant 驱动的分析循环可以表达为：
+
+```text
+维护 Candidate Warrant Space
+  -> 选择最有区分度的 Evidence Action
+  -> 执行工具获取 Evidence
+  -> 形成 Atomic Claims
+  -> 更新 Warrant Ledger
+  -> 对仍被支持的 Warrant 形成 Inference
+  -> 判断继续、停止或转人工
+```
+
+这里的 `done` 不是“LLM 认为答案已经不错”，而是显式终止协议。满足以下任一条件即可停止：
+
+1. **Supported**：至少一个 Warrant 达到任务要求的支持强度，Inference 通过 Evidence Soundness、Claim Sufficiency、Inference Warrant 和 Traceability 测试。
+2. **Resolved by scope**：任务只是简单取数，Evidence 已足以形成 Claim，不需要进入 Warrant / Inference 层。
+3. **Inconclusive**：剩余 Warrant 在当前可用数据下不可区分，系统明确输出缺少什么 Evidence。
+4. **Rejected**：所有候选 Warrant 均被削弱或排除，需要重新定义 Analysis Spec 或生成新的候选空间。
+5. **Escalated**：涉及高风险因果、价值判断、业务语义冲突或超出授权范围，转交 Domain Agent 或 Human。
+6. **Budget exhausted**：达到时间、成本或迭代上限，输出当前 Ledger、未解决分歧和下一步建议，而不是强行给出确定结论。
+
+因此，这个 Agent Loop 的优化目标不是无限寻找更多分析，而是：
+
+> 持续缩小可行的 Warrant Space，直到 Inference 获得足够支持，或系统能够准确说明为什么当前无法形成可靠 Inference。
+
+### 6.9 明确禁止的生产方式
+
+以下路径必须被 Critic 拒绝：
+
+```text
+Target Inference
+  -> 生成支持它的 Claim
+  -> 反向编造 Warrant
+  -> 只寻找确认性 Evidence
+```
+
+典型反例：
+
+```text
+Claim：太阳今天从东边升起
+Target Inference：太阳明天也会从东边升起
+伪 Warrant：总能根据今天的观察预测明天
+```
+
+问题不在于 statement 的语言是否通顺，而在于它没有说明可迁移机制、适用范围、稳定性假设和反证条件。合格的 Warrant 必须能在目标 Inference 之外被独立描述，并产生可被观察挑战的预测。
+
 ## 7. 最小可复用测试内核
 
 不按“趋势分析、因果分析、实验分析、建模分析”等任务类型拆出大量测试体系，而是保留以下通用内核。
@@ -568,10 +835,14 @@ WarrantVersion
   - warrant_id
   - version
   - statement
+  - scope
   - assumptions
   - predictions
   - disconfirming_conditions
-  - evidence_refs
+  - required_evidence
+  - supporting_evidence_refs
+  - opposing_evidence_refs
+  - provenance
   - status
 
 Inference
@@ -617,10 +888,11 @@ Inference
 建议：
 
 1. 用版本化 Ledger 保存 Warrant。
-2. 支持 strengthen、weaken、specialize、split、reject。
-3. 对因果、实验、评分卡等高风险任务启用 Domain Agent。
-4. Domain Agent 负责领域语义和方法边界，不替代 Critic。
-5. 将高价值、人工确认过的 Warrant 沉淀到知识库。
+2. 支持 propose、instantiate、support、weaken、specialize、split、reject、promote。
+3. 将 Warrant 编译为可执行的 Evidence Requirements，并保存完整映射。
+4. 对因果、实验、评分卡等高风险任务启用 Domain Agent。
+5. Domain Agent 负责领域语义和方法边界，不替代 Critic。
+6. 将高价值、人工确认过的 Warrant 以 Promoted Warrant 形式沉淀到知识库。
 
 ### P3：迁移到 LangChain / LangGraph 或其他纯 API Runtime
 
